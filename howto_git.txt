@@ -1,0 +1,27 @@
+1. Query repository path 
+	svn info 			: git remote -v 
+
+2. Add file
+	svn add filename	: git add filename 
+
+3. Query Modified/Changed Files 
+	svn st 				: git status -s 
+
+4. Diff File 
+	svn diff filename	: git diff filename 
+
+5. Revert Changed
+	svn revert filename	: git checkout filename or rm filename > git ls-files -d > git checkout filename
+
+6. Commit
+	svn ci 				: git commit (to commit added files)
+						: git commit filename (to commit modifed files)
+
+7. Query Log
+	svn log				: git log
+
+8. Update remote repository 
+						: git push 
+
+9. Retrieve remote repository changes 
+	svn up				: git pull
