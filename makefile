@@ -1,12 +1,12 @@
 CC      = gcc
-CFLAGS  = -g -I/usr/include -I/usr/include/pcap
+CFLAGS  = -g -I/usr/include -I/usr/include/pcap -Izslib
 CFLAGS += -Wall  -pthread -O2 -Wno-unused-variable# -Wwrite-strings # -Wstrict-prototypes
-LD      = -lpcap #../cpm/l6_lib/l6_libs.a
+LD      = -lpcap zslib/zslib.a
 OBJ_DIR = objs
 
 USER_OBJS = $(OBJ_DIR)/sklist.o $(OBJ_DIR)/main.o
 
-DEPEND = 
+DEPEND = packet_header.h
 
 all:  test
 

@@ -12,7 +12,7 @@
 #include <netinet/udp.h>
 
 #include "packet_header.h"
-
+#include "zslib.h"
 /* ---------- override below 
  */
 
@@ -40,9 +40,7 @@ typedef struct
 	// L2 layer	
 	int				vlan;
 	// IP Layer 
-	int				is_v4;
-	ip_t			ip_src;
-	ip_t			ip_dst;
+	zl_ip_t			ip_src, ip_dest; 
 	// L4 Layer - common
 	int				proto; // IPPROTO_xxx
 	int				sport, dport; 
@@ -57,49 +55,50 @@ typedef struct
 			int				win;
 			int				urg;
 			int				flag;	// TCP_FLAG_xxx
-		} tcp;	// tcphdr_t
+		} tcp;	// p_tcp_t
 	}l4;
-} parse_info_t;
+} decode_t;
 
 /* ---------- reporting
  */
 
-void report_arp(parse_info_t* pinfo)
-{	LOG("arp  : %x -> %x, %d/%d", pinfo->ip_src.v4, pinfo->ip_dst.v4, 
+void report_arp(decode_t* pinfo)
+{	LOG("arp  : %x -> %x, %d/%d", pinfo->ip_src.v4, pinfo->ip_dest.v4, 
 		pinfo->packet_len, pinfo->payload_len);
 }
-void report_ipv6(parse_info_t* pinfo)
-{	LOG("ipv6 : %x -> %x, %d/%d", pinfo->ip_src.v4, pinfo->ip_dst.v4, 
+void report_ipv6(decode_t* pinfo)
+{	LOG("ipv6 : %x -> %x, %d/%d", pinfo->ip_src.v4, pinfo->ip_dest.v4, 
 		pinfo->packet_len, pinfo->payload_len);
 }
-void report_unknown_l3(parse_info_t* pinfo)
-{	LOG("L2 ? : %x -> %x, %d/%d", pinfo->ip_src.v4, pinfo->ip_dst.v4, 
+void report_unknown_l3(decode_t* pinfo)
+{	LOG("L2 ? : %x -> %x, %d/%d", pinfo->ip_src.v4, pinfo->ip_dest.v4, 
 		pinfo->packet_len, pinfo->payload_len);
 }
-void report_icmp(parse_info_t* pinfo)
-{	LOG("ICMP : %x -> %x, %d/%d", pinfo->ip_src.v4, pinfo->ip_dst.v4, 
+void report_icmp(decode_t* pinfo)
+{	LOG("ICMP : %x -> %x, %d/%d", pinfo->ip_src.v4, pinfo->ip_dest.v4, 
 		pinfo->packet_len, pinfo->payload_len);
 }
-void report_udp(parse_info_t* pinfo)
+void report_udp(decode_t* pinfo)
 {	LOG("UDP  : %x:%d -> %x:%d, %d/%d", pinfo->ip_src.v4, pinfo->sport, 
-		pinfo->ip_dst.v4, pinfo->dport, 
+		pinfo->ip_dest.v4, pinfo->dport, 
 		pinfo->packet_len, pinfo->payload_len);
 }
-void report_tcp(parse_info_t* pinfo)
-{	LOG("TCP  : %x:%d -> %x:%d, %d/%d", pinfo->ip_src.v4, pinfo->sport, 
-		pinfo->ip_dst.v4, pinfo->dport, 
+void report_tcp(decode_t* pinfo)
+{	LOG("TCP  : %s:%d -> %s:%d, %d/%d", 
+		zl_ip_to_str(&pinfo->ip_src), pinfo->sport, 
+		zl_ip_to_str(&pinfo->ip_dest), pinfo->dport, 
 		pinfo->packet_len, pinfo->payload_len);
 }
-void report_unknown_l4(parse_info_t* pinfo)
+void report_unknown_l4(decode_t* pinfo)
 {	LOG("L3 %d : %x -> %x, %d/%d", pinfo->proto, pinfo->ip_src.v4,
-		pinfo->ip_dst.v4, 
+		pinfo->ip_dest.v4, 
 		pinfo->packet_len, pinfo->payload_len);
 }
 
 /* ---------- parser 
  */
 
-int parse_l4(parse_info_t* pinfo, int* next, const uint8_t* raw)
+int decode_l4(decode_t* pinfo, int* next, const uint8_t* raw)
 {	const uint8_t*	raw_org = raw; 
 	int				proto = (*next);
 
@@ -109,11 +108,11 @@ int parse_l4(parse_info_t* pinfo, int* next, const uint8_t* raw)
 		return 0;
 	}	
 	else if (proto == IPPROTO_UDP)
-	{	udphdr_t*	hdr = (udphdr_t*) raw; 
+	{	p_udp_t*	hdr = (p_udp_t*) raw; 
 		raw += sizeof(*hdr);
 
 		pinfo->proto = proto; 
-		pinfo->sport = ntohs(hdr->source);
+		pinfo->sport = ntohs(hdr->src);
 		pinfo->dport = ntohs(hdr->dest);
 
 		pinfo->payload_len -= (raw - raw_org);
@@ -121,12 +120,12 @@ int parse_l4(parse_info_t* pinfo, int* next, const uint8_t* raw)
 		return 0;
 	}
 	else if (proto == IPPROTO_TCP)
-	{	tcphdr_t* 	hdr = (tcphdr_t*)raw; 
+	{	p_tcp_t* 	hdr = (p_tcp_t*)raw; 
 
 		raw += sizeof(*hdr);
 
 		pinfo->proto = proto; 
-		pinfo->sport = ntohs(hdr->source); 
+		pinfo->sport = ntohs(hdr->src); 
 		pinfo->dport = ntohs(hdr->dest); 
 
 		pinfo->payload_len -= (raw - raw_org);
@@ -144,10 +143,10 @@ int parse_l4(parse_info_t* pinfo, int* next, const uint8_t* raw)
 		// save optional field
 		if ((hdr->doff * 4) > sizeof(*hdr))
 		{	int				remain = (hdr->doff * 4) - sizeof(*hdr);	
-			tcpopthdr_t*	opt; 
+			p_tcp_opt_t*	opt; 
 
 			for(; remain > 0; )
-			{	opt = (tcpopthdr_t*) raw; 
+			{	opt = (p_tcp_opt_t*) raw; 
 				switch (opt->type)
 				{	case 2 : // MSS 
 						pinfo->l4.tcp.mss = ntohs(opt->d.d16);
@@ -172,7 +171,7 @@ int parse_l4(parse_info_t* pinfo, int* next, const uint8_t* raw)
 		// TODO check control & payload & any optional.. 
 		report_tcp(pinfo);
 
-		// parse_info_t tcphdr_t
+		// decode_t p_tcp_t
 
 		return 0;
 	}
@@ -183,17 +182,16 @@ int parse_l4(parse_info_t* pinfo, int* next, const uint8_t* raw)
 	}
 }
 
-int parse_l3(parse_info_t* pinfo, int* next, const uint8_t* raw)
+int decode_l3(decode_t* pinfo, int* next, const uint8_t* raw)
 {	const uint8_t* 	raw_org = raw; 
 	int				family = (*next);	
-
+ 
 	if (family == ETHERTYPE_ARP)
-	{	arp_t*	ah = (arp_t*)raw; 
+	{	p_arp_t*	ah = (p_arp_t*)raw; 
 		raw += sizeof(*ah);
 	
-		pinfo->is_v4 = 1;
-		pinfo->ip_src.v4 = ntohl(ah->source_ip);	
-		pinfo->ip_dst.v4 = ntohl(ah->target_ip);	
+		zl_ip_set_ip4(&pinfo->ip_src, ntohl(ah->src_ip));
+		zl_ip_set_ip4(&pinfo->ip_dest, ntohl(ah->dest_ip));
 
 		pinfo->payload_len -= (raw - raw_org);
 		report_arp(pinfo);
@@ -201,24 +199,22 @@ int parse_l3(parse_info_t* pinfo, int* next, const uint8_t* raw)
 		return 0; 
 	}
 	else if (family == ETHERTYPE_IP)
-	{	iphdr_t*	iph = (iphdr_t*)raw; 
+	{	p_ip4_t*	iph = (p_ip4_t*)raw; 
 		raw += sizeof (*iph);
 
-		pinfo->is_v4 = 1; 
-		pinfo->ip_src.v4 = ntohl(iph->saddr);
-		pinfo->ip_dst.v4 = ntohl(iph->daddr);
+		zl_ip_set_ip4(&pinfo->ip_src, ntohl(iph->src)); 
+		zl_ip_set_ip4(&pinfo->ip_dest, ntohl(iph->dest));
 
 		(*next) = iph->protocol;
 
 		return (raw - raw_org);
 	}
 	else if (family == ETHERTYPE_IPV6)	
-	{	ipv6hdr_t*	iph = (ipv6hdr_t*)raw;
+	{	p_ip6_t*	iph = (p_ip6_t*)raw;
 		raw += sizeof (*iph);
 
-		pinfo->is_v4 = 0;
-		memcpy(pinfo->ip_src.v6, &iph->saddr, 16);
-		memcpy(pinfo->ip_dst.v6, &iph->daddr, 16);
+		zl_ip_set_ip6(&pinfo->ip_src, &iph->src); 
+		zl_ip_set_ip6(&pinfo->ip_dest, &iph->dest);
 
 		// TODO process optional header
 
@@ -233,20 +229,20 @@ int parse_l3(parse_info_t* pinfo, int* next, const uint8_t* raw)
 	}	
 }
 
-int parse_l2(parse_info_t* pinfo, int* next, const uint8_t* raw)
+int decode_l2(decode_t* pinfo, int* next, const uint8_t* raw)
 {	const uint8_t*	raw_org = raw;	
-	ether_t*		eh = (ether_t*)raw; 
+	p_ether_t*		eh = (p_ether_t*)raw; 
 	uint16_t		family;
 
 	raw += sizeof(*eh);
-	family = ntohs(eh->h_proto);
+	family = ntohs(eh->proto);
 
 	// check VLAN
 	if (family == ETHERTYPE_VLAN)
-	{	ether_vlan_t* vh = (ether_vlan_t*)raw; 
+	{	p_vlan_t* vh = (p_vlan_t*)raw; 
 		raw += sizeof(*vh);
 
-		pinfo->vlan = ntohs(vh->vlan_id);
+		pinfo->vlan = ntohs(vh->vlan);
 		family = ntohs(vh->proto);
 
 	}
@@ -260,7 +256,7 @@ int parse_l2(parse_info_t* pinfo, int* next, const uint8_t* raw)
 
 void parse_pcap(struct pcap_pkthdr* hdr, const uint8_t* raw)
 {	const uint8_t*	raw_org = raw; 	
-	parse_info_t	pinfo; 
+	decode_t	pinfo; 
 	int				len; 
 	int				next;
 
@@ -272,19 +268,19 @@ void parse_pcap(struct pcap_pkthdr* hdr, const uint8_t* raw)
 	raw += g_dlt_offset; 	
 
 	// check VLAN & L2 header
-	if ((len = parse_l2(&pinfo, &next, raw)) <= 0)
+	if ((len = decode_l2(&pinfo, &next, raw)) <= 0)
 	{	return;	}
 
 	raw += len; 
 	pinfo.payload_len -= len; 
 
 	// check L3 & IP layer
-	if ((len = parse_l3(&pinfo, &next, raw)) <= 0)
+	if ((len = decode_l3(&pinfo, &next, raw)) <= 0)
 	{	return;	}
 
 	raw += len; 
 	pinfo.payload_len -= len;
-	parse_l4(&pinfo, &next, raw);
+	decode_l4(&pinfo, &next, raw);
 }
 
 #if 0 
@@ -305,7 +301,7 @@ typedef struct
 
 	int			vlan_id;
 	ip_t		src;
-	ip_t		dst;
+	ip_t		dest;
 
 
 	int			is_ipv4; 
@@ -316,7 +312,7 @@ typedef struct
 	union 
 	{	uint32_t	v4; 
 		uint8_t		v6[16];
-	} ip_dst;
+	} ip_dest;
 
 	int			proto;
 	union
@@ -346,7 +342,7 @@ void dump(char* title, const u_char* data, int len)
 void parse_2(parse_t* parse, struct pcap_pkthdr* hdr, const u_char* raw)
 {	
 	const u_char*	org = raw;
-	ether_t*		eh; 
+	p_ether_t*		eh; 
 	uint16_t		family; 
 	char			proto;
 
@@ -354,14 +350,14 @@ void parse_2(parse_t* parse, struct pcap_pkthdr* hdr, const u_char* raw)
 
 	raw += g_dlt_offset; 
 
-	eh = (ether_t*)raw; 
+	eh = (p_ether_t*)raw; 
 	raw += sizeof(*eh);
 
 	family = ntohs(eh->h_proto);
 
 	// check VLAN header
 	if (family == ETHERTYPE_VLAN)
-	{	ether_vlan_t* vh = (ether_vlan_t*)raw;
+	{	p_vlan_t* vh = (p_vlan_t*)raw;
 		raw += sizeof(*vh);	
 		parse->vlan_id = ntohs(vh->vlan_id);
 		family = ntohs(vh->proto);
@@ -370,12 +366,12 @@ void parse_2(parse_t* parse, struct pcap_pkthdr* hdr, const u_char* raw)
 	{	parse->vlan_id = 0;	}
 		
 	if (family == ETHERTYPE_ARP)
-	{	arp_t*	ah = (arp_t*)raw;	
+	{	p_arp_t*	ah = (p_arp_t*)raw;	
 		raw += sizeof(*ah);
 
 		parse->is_ipv4 = 1;
 		parse->ip_src.v4 = ntohl(ah->source_ip);
-		parse->ip_dst.v4 = ntohl(ah->target_ip);
+		parse->ip_dest.v4 = ntohl(ah->target_ip);
 
 		parse->type = IS_ARP;
 	
@@ -383,34 +379,34 @@ void parse_2(parse_t* parse, struct pcap_pkthdr* hdr, const u_char* raw)
 	}
 
 	if (family == ETHERTYPE_IPV6)	// TODO later
-	{	ipv6hdr_t*	iph = (ipv6hdr_t*)raw; 
+	{	p_ip6_t*	iph = (p_ip6_t*)raw; 
 		raw += sizeof(*iph);	
 
 		parse->is_ipv4 = 0;
 		memcpy(parse->ip_src.v6, &iph->saddr, 16);
-		memcpy(parse->ip_dst.v6, &iph->daddr, 16);
+		memcpy(parse->ip_dest.v6, &iph->daddr, 16);
 		
 		parse->type = IS_IP_UNKNOWN;
 		return;
 	}
 	else if (family == ETHERTYPE_IP)
-	{	iphdr_t*	iph = (iphdr_t*)raw; 
+	{	p_ip4_t*	iph = (p_ip4_t*)raw; 
 		raw += sizeof(*iph);
 
 		parse->is_ipv4 = 1;
 		parse->ip_src.v4 = ntohl(iph->saddr);
-		parse->ip_dst.v4 = ntohl(iph->daddr);
+		parse->ip_dest.v4 = ntohl(iph->daddr);
 		proto = iph->protocol;
-		LOG("IP : %08x : %08x", parse->ip_src.v4, parse->ip_dst.v4);
+		LOG("IP : %08x : %08x", parse->ip_src.v4, parse->ip_dest.v4);
 	}
 	else
 	{	parse->type = IS_NON_IP_UNKNOWN;	return;
 	}
 
 	if (proto == IPPROTO_UDP)	// here
-	{	udphdr_t* hdr = (udphdr_t*)raw; 
+	{	p_udp_t* hdr = (p_udp_t*)raw; 
 		raw += sizeof(*hdr);
-		parse->l4.udp.sport = ntohs(hdr->source);
+		parse->l4.udp.sport = ntohs(hdr->src);
 		parse->l4.udp.dport = ntohs(hdr->dest);
 		parse->payload_len = parse->packet_len - (raw - org);
 		LOG("udp : %d", parse->payload_len);
@@ -535,6 +531,8 @@ int main(int argc, char* argv[])
 	int64_t			total_read, cur_read;
 	struct timeval	last_stat_time;
 	char			pcap_file[128]; ;
+
+	zl_init();
 
 	// initialize options 
 	strcpy(g_dev_name, "any");
