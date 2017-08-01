@@ -1,3 +1,4 @@
 *.swp
 objs/
 test
+l6_lib
