@@ -6,7 +6,7 @@ OBJ_DIR = objs
 
 USER_OBJS = $(OBJ_DIR)/sklist.o $(OBJ_DIR)/main.o
 
-DEPEND = packet_header.h
+DEPEND = decode.h
 
 all:  test
 

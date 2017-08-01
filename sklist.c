@@ -14,6 +14,10 @@
 #include <stdarg.h>
 #include <sys/types.h>
 #include <sys/times.h>
+#include <sys/time.h>
+#include <stdint.h>
+
+#include "common.h"
 
 /* ---------- override below 
  */
@@ -25,8 +29,6 @@
  */
 
 // #define LOCAL_TEST
-
-typedef unsigned long long int 	uint64_t;
 
 #define PTR(x)					((int)((int64_t)(x)) & 0xffff)
 
@@ -57,6 +59,7 @@ typedef struct
 	int				lvl; 		// current level (lvl > uniq_lvl)
 	int				total;
 	int64_t			cur_time;	// current time in msec (relative time)
+	struct timeval	tm_start; 	// creation time
 } sklist_t;	// skiplist
 
 /* ---------- internals 
@@ -268,24 +271,10 @@ static snode_t* srch_node(sklist_t* sl, snode_t** update, uint64_t key_g, uint64
 	return NULL;
 }
 
-static void update_time(char* ptr, int test_flag)
-{	// order skiplist to get current time 
-	// set test_flag = 0 (used ONLY for test)
-	sklist_t*	sl = (sklist_t*) ptr; 
-
-	if (ptr == NULL)	{	return;	}
-
-	if (test_flag == 0)
-	{	sl->cur_time = times(NULL) * 10;	}
-	else
-	{	sl->cur_time += test_flag;	}
-
-	chk_expire(sl, 20);
-}
 /* ---------- libraries
  */
 
-int sklist_get_nodes(char* ptr)
+int sklist_get_tot_nodes(char* ptr)
 {	sklist_t*	sl = (sklist_t*) ptr; 
 
 	if (ptr == NULL)	{	return 0;	}
@@ -314,7 +303,7 @@ int sklist_get_expired(char* ptr, uint64_t* key_g, uint64_t* key_u, void** data_
 	}
 }
 
-int sklist_srch_g(char* ptr, uint64_t key_g, uint64_t** key_u, void*** data_u)
+int sklist_srch_grp(char* ptr, uint64_t key_g, uint64_t** key_u, void*** data_u)
 {	// search skiplist having key_g 
 	// return total number of having same key_g	
 	// key_u : key_u array having same key_g (MUST be freed by caller)
@@ -390,7 +379,7 @@ int sklist_srch_g(char* ptr, uint64_t key_g, uint64_t** key_u, void*** data_u)
 	return total;
 }
 
-int sklist_del_g(char* ptr, uint64_t key_g, uint64_t** key_u, void*** data_u)	
+int sklist_del_grp(char* ptr, uint64_t key_g, uint64_t** key_u, void*** data_u)	
 {	// delete node having same key_g	
 	// return total number of having same key_g	
 	// key_u : key_u array having same key_g (MUST be freed by caller)
@@ -464,7 +453,7 @@ int sklist_del_g(char* ptr, uint64_t key_g, uint64_t** key_u, void*** data_u)
 	return total;
 }
 
-void* sklist_srch_e(char* ptr, uint64_t key_g, uint64_t key_u)	// search exact node
+void* sklist_srch_exact(char* ptr, uint64_t key_g, uint64_t key_u)	// search exact node
 {	// search node having key_g & key_u	
 	// return user_data
 	// return NULL if error
@@ -484,7 +473,7 @@ void* sklist_srch_e(char* ptr, uint64_t key_g, uint64_t key_u)	// search exact n
 	return NULL;	
 }
 
-void* sklist_del_e(char* ptr, uint64_t key_g, uint64_t key_u)	// delete exact node
+void* sklist_del_exact(char* ptr, uint64_t key_g, uint64_t key_u)	// delete exact node
 {	// delete node having key_g & key_u	
 	// return user_data
 	// return NULL if error
@@ -504,7 +493,7 @@ void* sklist_del_e(char* ptr, uint64_t key_g, uint64_t key_u)	// delete exact no
 		free (x);
 		return data_u; 	
 	}
-	LOG("%s, k=%llx:%llx, not found", __func__, key_g, key_u);
+	LOG("%s, k=%zx:%zx, not found", __func__, key_g, key_u);
 	return NULL;	
 }
 
@@ -612,9 +601,44 @@ void sklist_free(char* ptr)
 	free(sl);
 }
 
+static void update_time(sklist_t* sl, int64_t add, int expiry_test)
+{	if (add != 0)
+	{	sl->cur_time += add; 	}
+	else
+	{	sl->cur_time = times(NULL) * 10;	}
 
-void sklist_update_time(char* ptr)
-{	update_time(ptr, 0);	}
+	if (expiry_test)	{	chk_expire(sl, expiry_test);	}
+}	
+
+void sklist_update_tm(char* ptr, int expiry_test)
+{	sklist_t* sl = (sklist_t*) ptr; 
+	if (ptr == NULL)	{	return;	}
+
+	clock_t	cur = times(NULL); 
+	update_time(sl, cur*10, expiry_test);
+}
+
+void sklist_update_tm_timeval(char* ptr, struct timeval* tm, int expiry_test)
+{	sklist_t*		sl = (sklist_t*) ptr; 
+	int64_t			msec; 
+	struct timeval	diff; 
+
+	if (ptr == NULL)	{	return;	}
+	
+	diff.tv_sec = tm->tv_sec - sl->tm_start.tv_sec; 
+	diff.tv_usec = tm->tv_usec - sl->tm_start.tv_usec; 
+
+	if (diff.tv_usec < 0)	
+	{	diff.tv_sec --; 
+		diff.tv_usec += (1000*1000); 
+	}
+
+	msec = diff.tv_sec;
+	msec *= (1000*1000); 
+	msec += (diff.tv_usec / 1000);
+
+	update_time(sl, msec, expiry_test); 
+}
 
 char* sklist_create(int max_nodes_approx)
 {	// create skiplist	
@@ -652,7 +676,8 @@ char* sklist_create(int max_nodes_approx)
 		sl->head->lvl[i].back = NULL;
 	}
 
-	update_time((char*)sl, 0);
+	gettimeofday(&sl->tm_start, NULL);
+	sl->cur_time = times(NULL) * 10;
 
 	return (char*) sl;
 }
@@ -715,12 +740,12 @@ void rand_add_del(char* sl, int max, int detail)
 	dump_slist(sl, detail, "add %d, order: random", total);
 
 	for(total = 0, key = 9; key >= 0; key--)
-	{	if (sklist_del_e(sl, ptn_del[key], ptn_del[key]) != NULL)	{	total++;	}
+	{	if (sklist_del_exact(sl, ptn_del[key], ptn_del[key]) != NULL)	{	total++;	}
 
 		for(k3 = key+1; k3 < key+2; k3++)
-		{	if (sklist_del_e(sl, key, k3) != NULL)		{	total++;	}	}
+		{	if (sklist_del_exact(sl, key, k3) != NULL)		{	total++;	}	}
 		for(k3 = 0; k3 < key; k3++)
-		{	if (sklist_del_e(sl, key, k3) != NULL)		{	total++;	}	}
+		{	if (sklist_del_exact(sl, key, k3) != NULL)		{	total++;	}	}
 	}
 	dump_slist(sl, detail, "del %d, order: random", total);
 }
@@ -738,7 +763,7 @@ void del(char* sl, int max, int detail)
 
 	st = get_msec(); 
 	for(key = 0; key < max; key++)
-	{	sklist_del_e(sl, key, key);	}
+	{	sklist_del_exact(sl, key, key);	}
 	en = get_msec(); 
 
 	dump_slist(sl, detail, "%zd [ms], after remove ALL, order:0 --> %d", en-st, max-1);
@@ -752,7 +777,7 @@ void del(char* sl, int max, int detail)
 
 	st = get_msec(); 
 	for(key = (max-1); key >= 0; key--)
-	{	sklist_del_e(sl, key, key);	}
+	{	sklist_del_exact(sl, key, key);	}
 	en = get_msec(); 
 
 	dump_slist(sl, detail, "%zd [ms], after remove ALL, order:%d --> 0", en-st, max-1);
@@ -809,13 +834,13 @@ void test(char* ptr, int max, int detail)
 	dump_slist(sl, detail, "add key_u"); 
 
 	// test srch_e
-	if ((ret = sklist_srch_e(sl, max, max)) != NULL)
+	if ((ret = sklist_srch_exact(sl, max, max)) != NULL)
 	{	ERR("srch_e error, line:%d", __LINE__);	}
 	else
 	{	LOG("k= %d/%d not found ==> OK", max, max);	}
 
 	for(err = 0, k = 1; k < max; k++)
-	{	if ((ret = sklist_srch_e(sl, k, k)) == NULL)
+	{	if ((ret = sklist_srch_exact(sl, k, k)) == NULL)
 		{	ERR("srch_e err, k:%d, line:%d", k, __LINE__);	err++;	}
 	}
 	if (err == 0)	{	LOG("srch 1 ~ %d ==> OK", max-1);	}
@@ -823,7 +848,7 @@ void test(char* ptr, int max, int detail)
 	// test srch_g
 	for (err = 0, k = 1; k < max; k++)
 	{	
-		cnt = sklist_srch_g(sl, k, &key_u, &data_u);
+		cnt = sklist_srch_grp(sl, k, &key_u, &data_u);
 		if (cnt != (k + 3))
 		{	ERR("srch_g err, k:%d, cnt:%d, line:%d", k, cnt, __LINE__); err++;	}
 		prt_key_grp("searched", k, cnt, key_u, data_u);
@@ -834,7 +859,7 @@ void test(char* ptr, int max, int detail)
 	
 	// test del_e
 	for(err = 0, k = 1; k < max; k++)
-	{	if (sklist_del_e(sl, k, k) == NULL)
+	{	if (sklist_del_exact(sl, k, k) == NULL)
 		{	ERR("del_e err, k:%d, line:%d", k, __LINE__);	err++;	}
 	}
 	if (err == 0)	{	LOG("del_e ==> OK");	}
@@ -842,7 +867,7 @@ void test(char* ptr, int max, int detail)
 
 	// test del_g
 	for(err = 0, k = (max-1); k >= 1; k--)
-	{	cnt = sklist_del_g(sl, k, &key_u, &data_u); 
+	{	cnt = sklist_del_grp(sl, k, &key_u, &data_u); 
 		if (cnt != (k+2))
 		{	ERR("del_g err, k:%d, cnt:%d, l:%d", k, cnt, __LINE__); err++;	}
 		prt_key_grp("deleted", k, cnt, key_u, data_u);
@@ -857,12 +882,12 @@ void test(char* ptr, int max, int detail)
 void expire(char* sl, int max, int detail)
 {	int		k, cnt;
 
-	update_time(sl, 1000);
+	update_time((sklist_t*) sl, 1000, 20);
 
 	for(k = (max-1); k >= 1; k--)	{	sklist_add_my(sl, k, k, k, 1);	}
 	dump_slist(sl, detail, "after ADD");
 
-	for(k = 1; k < max; k++)		{	update_time(sl, 1000);	}
+	for(k = 1; k < max; k++)		{	update_time((sklist_t*) sl, 1000, 20);	}
 	dump_slist(sl, detail, "after update time");
 
 	for(k = 1, cnt = 1; k < max; k++)
@@ -881,7 +906,7 @@ void expire(char* sl, int max, int detail)
 	}
 	dump_slist(sl, detail, "after ADD");
 
-	for(k = 1; k < max; k++)		{	update_time(sl, 1000);	}
+	for(k = 1; k < max; k++)		{	update_time((sklist_t*) sl, 1000, 20);	}
 	dump_slist(sl, detail, "after update time");
 }
 
