@@ -28,7 +28,7 @@ char		g_filter_rule[128];
 int			g_stat_intv;	
 int			g_dlt_offset;		// pcap datalink header length
 
-char*		g_flow;
+char*		g_flow_list;
 
 typedef struct 
 {	short	pos; 
@@ -62,22 +62,92 @@ typedef struct
 	int				port_src, port_dest; 
 
 	dec_tcp_t*		tcp;
-/*
-	union 
-	{	struct 
-		{	int				mss; 		// SYN only
-			int				win_scale;	// SYN only
-			int				use_sack;	// SYN only
-
-			uint32_t		seq;
-			uint32_t		ack; 
-			int				win;
-			int				urg;
-			int				flag;	// TCP_FLAG_xxx
-		} tcp;	// p_tcp_t
-	}l4;
-*/
 } decode_t;
+
+// ---------- flow ---------------
+
+typedef struct 
+{	
+	struct 
+	{	zl_ip_t		ip; 
+		int			port; 
+		int			init_seq, init_ack, init_win;
+		int			mss;
+		int			sack;
+		int			win_scale;
+	} src, dest;
+	int				ambiguous_src;
+	int				step_open;		// TCP_F_SYN|SYN_ACK
+	int				step_close;		// TCP_F_RST|FIN|FIN_ACK
+} flow_tcp_t;
+
+typedef struct 
+{	union
+	{	uint64_t		k; 
+		struct 
+		{	uint32_t	v4_l;		// lower side IPv4 
+			uint32_t	v4_h;		// upper side IPv4
+		} __attribute__ ((packed)); 
+	} g;	
+	union 
+	{	uint64_t		k;
+		struct 
+		{	uint16_t	vlan; 	// VLAN id
+			uint8_t		proto; 	// IPPROTO_xxx
+			uint8_t		pad;	// 
+			uint16_t	port_l; // port number of lower side IP
+			uint16_t	port_h;	// port number of upper side IP
+		} __attribute__ ((packed));
+	} u;
+} flow_key_t;
+
+flow_key_t* flow_make_key(flow_key_t* fkey, decode_t* dec)
+{	
+	if (dec->ip_src.v4 < dec->ip_dest.v4)
+	{	fkey->g.v4_l = dec->ip_src.v4; 
+		fkey->g.v4_h = dec->ip_dest.v4; 
+		fkey->u.port_l = dec->port_src;
+		fkey->u.port_h = dec->port_dest;
+	}
+	else
+	{	fkey->g.v4_l = dec->ip_dest.v4; 
+		fkey->g.v4_h = dec->ip_src.v4; 
+		fkey->u.port_l = dec->port_dest;
+		fkey->u.port_h = dec->port_src;
+	}
+	fkey->u.vlan = dec->vlan;
+	fkey->u.proto = dec->proto;
+	fkey->u.pad = 0;
+
+	return fkey;
+}
+
+void* flow_add(char* flow_list, flow_key_t* fkey, int size, int expire_at, int* exist)
+{	void** 	ret; 
+
+	ret = sklist_add(flow_list, fkey->g.k, fkey->u.k, expire_at); 
+	THROW_L(ERR, ret == NULL, "malloc err(%d)", errno);
+
+	if ((*ret) == NULL)
+	{	(*ret) = malloc(size);
+		THROW_L(CLR_ERR, (*ret) == NULL, "malloc2 err(%d)", errno);
+		*exist = 0; 
+	}
+	else
+	{	*exist = 1; 
+	}
+
+	LOG("%s, size:%d, already exist:%d", __func__, size, *exist);
+
+	return *ret;
+
+CATCH(ERR);
+	return NULL;
+
+CATCH(CLR_ERR);
+	sklist_del_exact(flow_list, fkey->g.k, fkey->u.k);
+	return NULL;
+}
 
 /* ---------- reporting
  */
@@ -105,8 +175,8 @@ void report_udp(decode_t* dec)
 }
 void report_tcp(decode_t* dec)
 {	LOG("TCP  : %s:%d -> %s:%d, %d/%d %s", 
-		zl_ip_to_str(&dec->ip_src), dec->port_src, 
-		zl_ip_to_str(&dec->ip_dest), dec->port_dest, 
+		zl_ip_print(&dec->ip_src), dec->port_src, 
+		zl_ip_print(&dec->ip_dest), dec->port_dest, 
 		dec->pkt_len, dec->payload_len, dec->trc.d);
 }
 void report_unknown_l4(decode_t* dec)
@@ -193,6 +263,37 @@ int decode_l4(decode_t* dec, int* next, const uint8_t* raw)
 			}
 		}
 
+		{	flow_tcp_t*	flow; 
+			flow_key_t	key; 
+			int			exist; 
+	
+			flow = flow_add(g_flow_list, flow_make_key(&key, dec), sizeof(flow_tcp_t), 1, &exist);
+			THROW(DROP, flow == NULL);
+			
+			if (exist == 0)	// init vars if newly added
+			{	flow->ambiguous_src = 1; 	flow->step_open = flow->step_close = 0;	}
+
+			if (dec->flag & TCP_F_SYN_ACK)
+/* asd
+			{	int		flag = dec->tcp->flag & (TCP_F_SYN | TCP_F_ACK);	
+
+				if (flag == TCP_F_SYN)
+				{	flow->ambiguous_src = 0;
+					flow_step |= TCP_F_SYN;
+					flow->ip_src = dec->ip_src;		flow->port_src = dec->port_src; 
+					flow->ip_dest = dec->ip_dest;	flow->port_dest = dec->port_dest; 
+				}
+				if (flag == (TCP_F_SYN | TCP_F_ACK))
+				{	flow->ip_src = dec->ip_dest;	flow->port_src = dec->port_dest; 
+					flow->ip_dest = dec->ip_src;	flow->port_dest = dec->port_src; 
+					flow->ambiguous_src = 0;
+				}
+			}
+*/
+			else
+			{	LOG("exist");	}
+		}
+
 		// TODO check control & payload & any optional.. 
 		report_tcp(dec);
 
@@ -205,6 +306,9 @@ int decode_l4(decode_t* dec, int* next, const uint8_t* raw)
 		report_unknown_l4(dec);
 		return 0;
 	}
+
+CATCH(DROP);
+	return -1;
 }
 
 int decode_l3(decode_t* dec, int* next, const uint8_t* raw)
@@ -230,7 +334,7 @@ int decode_l3(decode_t* dec, int* next, const uint8_t* raw)
 		zl_ip_set_ip4(&dec->ip_src, ntohl(iph->src)); 
 		zl_ip_set_ip4(&dec->ip_dest, ntohl(iph->dest));
 
-		(*next) = iph->protocol;
+		(*next) = iph->proto;
 
 		return (raw - raw_org);
 	}
@@ -315,32 +419,25 @@ pcap_t*	prepare_pcap(char* file, char* dev_name, char* filter, int snap_len, int
 {	char				err[PCAP_ERRBUF_SIZE]; 
 	pcap_t*				pc; 
 	struct bpf_program	fp;
+	int					ret;
 
 	if (file[0] == 0)	// live
 	{	pc = pcap_open_live(dev_name, snap_len, 1 /* promiscuous */, 
 			read_to /* msec */, err); 
-	
-		if (pc == NULL)
-		{	ERR("Can't open pcap : %s", err);	return NULL;	}
+		THROW_L(ERR, pc == NULL, "open pcap err(%s)", err);
 	}
 	else
 	{	pc = pcap_open_offline(file, err); 
-		if (pc == NULL)
-		{	ERR("Can't open file : %s", err);	return NULL;	}
+		THROW_L(ERR, pc == NULL, "open file err(%s)", err);
 	}
 	
 	if (strcasecmp(filter, "any") != 0)
-	{	if (pcap_compile(pc, &fp, filter, 0, PCAP_NETMASK_UNKNOWN) < 0)
-		{	ERR("Can't compile filter rule : %s", filter);
-			pcap_close(pc);
-			return NULL;
-		}
+	{		
+		ret = pcap_compile(pc, &fp, filter, 0, PCAP_NETMASK_UNKNOWN); 
+		THROW_L(CLOSE_ERR, ret < 0, "compile rule err(%s)", filter);
 	
-		if (pcap_setfilter(pc, &fp) < 0)
-		{	ERR("Can't Set Filter");	
-			pcap_close(pc);
-			return NULL;
-		}
+		ret = pcap_setfilter(pc, &fp);
+		THROW_L(CLOSE_ERR, ret < 0, "set filter err(%s)", filter);
 	}
 
 	switch(pcap_datalink(pc))
@@ -353,6 +450,12 @@ pcap_t*	prepare_pcap(char* file, char* dev_name, char* filter, int snap_len, int
 	}
 
 	return pc;
+
+CATCH(ERR);
+	return NULL;
+CATCH(CLOSE_ERR);
+	pcap_close(pc); 
+	return NULL;
 }
 
 /* ---------- main
@@ -366,8 +469,7 @@ int disp_dev_list(int id, char* name)
 	char		ipbuf[128]; 
 	int			pos, i;
 
-	if (pcap_findalldevs(&dev, err) < 0)
-	{	LOG("No Devices : %s", err);	return -1;	}
+	THROW_L(ERR, pcap_findalldevs (&dev, err) < 0, "no device (%s)", err);
 
 	if (name == NULL)	{	LOG("Device List");	}
 
@@ -391,7 +493,9 @@ int disp_dev_list(int id, char* name)
 		cur = cur->next;
 	}
 	pcap_freealldevs(dev);
+CATCH(ERR);
 	return -1;
+
 }
 
 void disp_help()
@@ -469,7 +573,7 @@ int main(int argc, char* argv[])
 	last_stat_time.tv_sec = 0; 
 	last_stat_time.tv_usec = 0; 
 
-	g_flow = sklist_create(0);
+	g_flow_list = sklist_create(0);
 
 	for(cur_read = 0, total_read = 0; total_read < 10;)
 	{	const u_char*		pcap_raw; // raw packet data 

@@ -68,7 +68,7 @@ typedef union
 	uint8_t		v6[16]; 
 	struct 
 	{	uint32_t	dmy[3];
-		uint32_t	v4;
+		uint32_t	v4;			// host endian 
 	};
 } zl_ip_t;	// host endian IP storage structure
 
@@ -78,7 +78,8 @@ typedef union
 int			zl_ip_is_v4(zl_ip_t* ptr);
 void		zl_ip_set_ip4(zl_ip_t* ptr, uint32_t ip);
 void		zl_ip_set_ip6(zl_ip_t* ptr, void* ip);
-const char* zl_ip_to_str(zl_ip_t* ptr);
+char* 		zl_ip_to_str(zl_ip_t* ptr, char* ret, int ret_len);
+#define 	zl_ip_print(ptr)	zl_ip_to_str(ptr, alloca(40), 40)
 
 // common.c
 int			zl_init();

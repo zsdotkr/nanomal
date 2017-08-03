@@ -1,6 +1,12 @@
 #ifndef __COMMON_H__
 #define __COMMON_H__
 
+// ---------- Global Macros ---------------
+#define THROW_L(jmp, x, fmt, y...)  if (unlikely((x)))    \
+									{   ERR(fmt " [%s/%d]",##y,  __func__, __LINE__);  goto _##jmp##_;    }
+#define THROW(jmp, x)               if (unlikely((x))) {   goto _##jmp##_; }
+#define CATCH(jmp, ...)     _##jmp##_:
+
 // ---------- prototypes ---------------
 
 // sklist.c

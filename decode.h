@@ -47,7 +47,7 @@ typedef struct p_ip4_t {
 
 	uint16_t		frag_off;
 	uint8_t			ttl;
-	uint8_t			protocol;
+	uint8_t			proto;
 	uint16_t		check;
 	uint32_t		src;
 	uint32_t		dest;
@@ -100,15 +100,17 @@ typedef struct p_tcp_t {
 					res1:4; 
 	#endif
 
-	uint8_t			flag;	// see TCP_FLAG_xxx
-	#define TCP_FLAG_FIN	0x01
-	#define TCP_FLAG_SYN	0x02
-	#define TCP_FLAG_RST	0x04
-	#define TCP_FLAG_PSH	0x08
-	#define TCP_FLAG_ACK	0x10
-	#define TCP_FLAG_URG	0x20
-	#define TCP_FLAG_ECN	0x40
-	#define TCP_FLAG_CWR	0x80
+	uint8_t			flag;	// see TCP_F_xxx
+	#define TCP_F_FIN	0x01
+	#define TCP_F_SYN	0x02
+	#define TCP_F_RST	0x04
+	#define TCP_F_PSH	0x08
+	#define TCP_F_ACK	0x10
+	#define TCP_F_URG	0x20
+	#define TCP_F_ECN	0x40
+	#define TCP_F_CWR	0x80
+	#define TCP_F_SYN_ACK	(TCP_F_SYN|TCP_F_ACK)
+	#define TCP_F_FIN_ACK	(TCP_F_FIN|TCP_F_ACK)
 
 	uint16_t		window;
 	uint16_t		check;

@@ -693,10 +693,10 @@ int64_t get_msec()
 	return ret;
 }
 
-void sklist_add_my(char* sl, uint64_t key_g, uint64_t key_u, int data, int expire_at)
+void sklist_add_my(char* sl, uint64_t key_g, uint64_t key_u, int data, int expire_after)
 {	void** ret; 
 
-	ret = sklist_add(sl, key_g, key_u, expire_at); 
+	ret = sklist_add(sl, key_g, key_u, expire_after); 
 
 	if (ret == NULL)
 	{	ERR("%s, fail, k=%llu/%llu/%d", __func__, key_g, key_u, data);	}
