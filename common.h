@@ -7,6 +7,17 @@
 #define THROW(jmp, x)               if (unlikely((x))) {   goto _##jmp##_; }
 #define CATCH(jmp, ...)     _##jmp##_:
 
+typedef enum
+{	APP_ERR = -1, 
+	APP_ARP = 0, 
+	APP_IP4,
+	APP_IP6,
+	APP_ICMP, 
+	APP_UDP, 
+	APP_TCP,
+	APP_UNKNOWN, 
+} app_t;
+
 // ---------- prototypes ---------------
 
 // sklist.c

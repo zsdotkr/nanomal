@@ -30,6 +30,10 @@ int			g_dlt_offset;		// pcap datalink header length
 
 char*		g_flow_list;
 
+// ------------------------------------------------
+// -------------------- decode --------------------
+// ------------------------------------------------
+
 typedef struct 
 {	short	pos; 
 	char	d[126]; 
@@ -38,6 +42,11 @@ typedef struct
 #define TRC_ADD(trc, fmt, y...) \
     {   (trc)->pos += snprintf(&(trc)->d[(trc)->pos], sizeof((trc)->d) - (trc)->pos, fmt " ", ##y); \
     }
+
+typedef struct 
+{	zl_ip_t			ip; 
+	int				port;
+} ip_port_t;
 
 typedef struct 
 {	uint32_t			seq;
@@ -49,36 +58,203 @@ typedef struct
 	int					win_scale;	// SYN
 	int					use_sack;		// SYN
 } dec_tcp_t;
+
 typedef struct 
 {	trc_t			trc;	
 	int				pkt_len;	// total length of packet
 	int				payload_len;// payload (L5) length
-	// L2 layer	
-	int				vlan;
-	// IP Layer 
-	zl_ip_t			ip_src, ip_dest; 
-	// L4 Layer - common
-	int				proto; // IPPROTO_xxx
-	int				port_src, port_dest; 
 
-	dec_tcp_t*		tcp;
+	int				vlan;
+	
+	ip_port_t		src, dest;
+
+	int				proto;	// IPPROTO_TCP|UDP|...
+	app_t			app; // APP_xxx
+	union 
+	{
+		dec_tcp_t	tcp;
+	};
 } decode_t;
 
-// ---------- flow ---------------
+int decode_l4(decode_t* dec, const uint8_t* raw, int cap_len)
+{	const uint8_t*	raw_org = raw;
+	const uint8_t*	end = raw_org + cap_len;
+	int				next_p; 	// next protocol
+
+	dec->proto = 0;
+	dec->app = APP_ERR;
+
+	{	p_ether_t*	eh = (p_ether_t*)raw;
+		raw += sizeof(*eh);
+		THROW_L(ERR, raw > end, "too short L2");
+
+		next_p = ntohs(eh->proto);
+		if (next_p == ETHERTYPE_VLAN)
+		{	p_vlan_t*	vh = (p_vlan_t*)raw; 
+			raw += sizeof(*vh);
+			THROW_L(ERR, raw > end, "too short VLAN");
+
+			dec->vlan = ntohs(vh->vlan);
+			TRC_ADD(&dec->trc, "VLAN:%d", dec->vlan);
+			next_p = ntohs(vh->proto);
+		}
+		else
+		{	dec->vlan = 0;	}
+	}
+
+	{	if (next_p == ETHERTYPE_ARP)
+		{	p_arp_t*	ah = (p_arp_t*)raw; 
+			raw += sizeof(*ah);
+			THROW_L(ERR, raw > end, "too short ARP");
+	
+			zl_ip_set_ip4(&dec->src.ip, ntohl(ah->src_ip));
+			zl_ip_set_ip4(&dec->dest.ip, ntohl(ah->dest_ip));
+
+			dec->app = APP_ARP;
+
+			return 0; 
+		}
+		else if (next_p == ETHERTYPE_IP)
+		{	p_ip4_t*	iph = (p_ip4_t*)raw; 
+			raw += sizeof (*iph);
+			THROW_L(ERR, raw > end, "too short IP");
+	
+			zl_ip_set_ip4(&dec->src.ip, ntohl(iph->src)); 
+			zl_ip_set_ip4(&dec->dest.ip, ntohl(iph->dest));
+	
+			next_p = iph->proto;
+		}
+		else if (next_p == ETHERTYPE_IPV6)	
+		{	p_ip6_t*	iph = (p_ip6_t*)raw;
+			raw += sizeof (*iph);
+			THROW_L(ERR, raw > end, "too short IP6");
+	
+			zl_ip_set_ip6(&dec->src.ip, &iph->src); 
+			zl_ip_set_ip6(&dec->dest.ip, &iph->dest);
+
+			// TODO process optional header
+	
+			dec->app = APP_IP6;
+
+			return 0;
+		}
+		else
+		{	dec->app = APP_UNKNOWN;
+			TRC_ADD(&dec->trc, "Unknwon family:%d", next_p);
+			return 0; 
+		}
+	}
+
+	{
+		if (next_p == IPPROTO_ICMP)
+		{	// TODO adjust payload
+			dec->app = APP_ICMP; 
+			dec->proto = IPPROTO_ICMP;
+			TRC_ADD(&dec->trc, "ICMP");
+			return 0;
+		}	
+		else if (next_p == IPPROTO_UDP)
+		{	p_udp_t*	hdr = (p_udp_t*) raw; 
+			raw += sizeof(*hdr);
+			THROW_L(ERR, raw > end, "too short UDP");
+
+			dec->proto = IPPROTO_UDP;
+			dec->src.port = ntohs(hdr->src);
+			dec->dest.port = ntohs(hdr->dest);
+
+			dec->app = APP_UDP;
+			TRC_ADD(&dec->trc, "UDP");
+			return 0;
+		}
+		else if (next_p == IPPROTO_TCP)
+		{	p_tcp_t* 	hdr = (p_tcp_t*)raw; 
+			dec_tcp_t* 	dec_tcp = &dec->tcp; 
+
+			raw += sizeof(*hdr);
+			THROW_L(ERR, raw > end, "too short TCP");
+
+			dec->proto = IPPROTO_TCP;
+			dec->src.port = ntohs(hdr->src); 
+			dec->dest.port = ntohs(hdr->dest); 
+// ---
+			dec_tcp->flag = hdr->flag;
+			dec_tcp->seq = ntohl(hdr->seq);
+			dec_tcp->ack = ntohl(hdr->ack_seq);
+			dec_tcp->win = ntohs(hdr->window);
+			dec_tcp->urg = ntohs(hdr->urg_ptr);
+			TRC_ADD(&dec->trc, "S/A/W=%d/%d/%d", dec_tcp->seq, dec_tcp->ack, dec_tcp->win);
+
+			dec_tcp->mss = 1460; 
+			dec_tcp->use_sack = 0; 
+			dec_tcp->win_scale = 0; 
+
+			// save optional field
+			if ((hdr->doff * 4) > sizeof(*hdr))
+			{	int				remain = (hdr->doff * 4) - sizeof(*hdr);	
+				p_tcp_opt_t*	opt; 
+
+				for(; remain > 0; )
+				{	opt = (p_tcp_opt_t*) raw; 
+					switch (opt->type)
+					{	case 2 : // MSS 
+						dec_tcp->mss = ntohs(opt->d.d16);
+						TRC_ADD(&dec->trc, "MSS:%d", dec_tcp->mss);
+						break;
+						case 4 : // SACK 
+						dec_tcp->use_sack = 1;
+						TRC_ADD(&dec->trc, "SACK");
+						break;
+						case 3 : // WINDOW SCALE
+						dec_tcp->win_scale = opt->d.d8;
+						TRC_ADD(&dec->trc, "WS:%d", dec_tcp->win_scale);
+						break;
+					}
+					if (opt->type == 1)	// NOP
+					{	raw += 1;	remain -= 1;	}
+					else
+					{	raw += opt->len; remain -= opt->len;	}
+				}
+			}
+			dec->app = APP_TCP; 
+			TRC_ADD(&dec->trc, "TCP");
+			return 0;
+		}
+		else
+		{	dec->app = APP_UNKNOWN; 	
+			return 0;
+		}
+	}
+	return 0; 
+
+CATCH(ERR)
+	return -1;
+}
+
+// ------------------------------------------------
+// -------------------- flow ----------------------
+// ------------------------------------------------
 
 typedef struct 
-{	
-	struct 
-	{	zl_ip_t		ip; 
-		int			port; 
-		int			init_seq, init_ack, init_win;
-		int			mss;
-		int			sack;
-		int			win_scale;
-	} src, dest;
-	int				ambiguous_src;
-	int				step_open;		// TCP_F_SYN|SYN_ACK
-	int				step_close;		// TCP_F_RST|FIN|FIN_ACK
+{	struct 
+	{	int64_t	byte, pkt; 	// out
+		int64_t	byte_dup, pkt_dup;	// out 
+	} lo, hi; 	
+} traf_t;	// traffic 
+
+typedef struct 
+{	int				app;	// APP_xxx	
+	struct flow_tcp_side_t
+	{	ip_port_t	ip_port; 
+		int			init_seq, init_win, init_mss, init_sack;
+		int			last_ack;
+		int			win_scale;	
+	} low, hi; 
+
+	char			client;	// 'l' (low), 'h' (high), 0x00 (unknown)
+	char			step_open;	// TCP_F_SYN | ACK
+	char			step_close;	// TCP_F_RST|FIN|ACK
+
+	traf_t			traf_low, traf_hi;
 } flow_tcp_t;
 
 typedef struct 
@@ -103,17 +279,17 @@ typedef struct
 
 flow_key_t* flow_make_key(flow_key_t* fkey, decode_t* dec)
 {	
-	if (dec->ip_src.v4 < dec->ip_dest.v4)
-	{	fkey->g.v4_l = dec->ip_src.v4; 
-		fkey->g.v4_h = dec->ip_dest.v4; 
-		fkey->u.port_l = dec->port_src;
-		fkey->u.port_h = dec->port_dest;
+	if (dec->src.ip.v4 < dec->dest.ip.v4)
+	{	fkey->g.v4_l = dec->src.ip.v4; 
+		fkey->g.v4_h = dec->dest.ip.v4; 
+		fkey->u.port_l = dec->src.port;
+		fkey->u.port_h = dec->dest.port;
 	}
 	else
-	{	fkey->g.v4_l = dec->ip_dest.v4; 
-		fkey->g.v4_h = dec->ip_src.v4; 
-		fkey->u.port_l = dec->port_dest;
-		fkey->u.port_h = dec->port_src;
+	{	fkey->g.v4_l = dec->dest.ip.v4; 
+		fkey->g.v4_h = dec->src.ip.v4; 
+		fkey->u.port_l = dec->dest.port;
+		fkey->u.port_h = dec->src.port;
 	}
 	fkey->u.vlan = dec->vlan;
 	fkey->u.proto = dec->proto;
@@ -149,241 +325,33 @@ CATCH(CLR_ERR);
 	return NULL;
 }
 
-/* ---------- reporting
- */
+void dump_flow_tcp(flow_tcp_t* flow)
+{	struct flow_tcp_side_t* side[2];
+	char			str1[64], str2[64]; 
+	int		i; 
 
-void report_arp(decode_t* dec)
-{	LOG("arp  : %x -> %x, %d/%d", dec->ip_src.v4, dec->ip_dest.v4, 
-		dec->pkt_len, dec->payload_len);
-}
-void report_ipv6(decode_t* dec)
-{	LOG("ipv6 : %x -> %x, %d/%d", dec->ip_src.v4, dec->ip_dest.v4, 
-		dec->pkt_len, dec->payload_len);
-}
-void report_unknown_l3(decode_t* dec)
-{	LOG("L2 ? : %x -> %x, %d/%d", dec->ip_src.v4, dec->ip_dest.v4, 
-		dec->pkt_len, dec->payload_len);
-}
-void report_icmp(decode_t* dec)
-{	LOG("ICMP : %x -> %x, %d/%d", dec->ip_src.v4, dec->ip_dest.v4, 
-		dec->pkt_len, dec->payload_len);
-}
-void report_udp(decode_t* dec)
-{	LOG("UDP  : %x:%d -> %x:%d, %d/%d", dec->ip_src.v4, dec->port_src, 
-		dec->ip_dest.v4, dec->port_dest, 
-		dec->pkt_len, dec->payload_len);
-}
-void report_tcp(decode_t* dec)
-{	LOG("TCP  : %s:%d -> %s:%d, %d/%d %s", 
-		zl_ip_print(&dec->ip_src), dec->port_src, 
-		zl_ip_print(&dec->ip_dest), dec->port_dest, 
-		dec->pkt_len, dec->payload_len, dec->trc.d);
-}
-void report_unknown_l4(decode_t* dec)
-{	LOG("L3 %d : %x -> %x, %d/%d", dec->proto, dec->ip_src.v4,
-		dec->ip_dest.v4, 
-		dec->pkt_len, dec->payload_len);
-}
-
-/* ---------- parser 
- */
-
-int decode_l4(decode_t* dec, int* next, const uint8_t* raw)
-{	const uint8_t*	raw_org = raw; 
-	int				proto = (*next);
-
-	if (proto == IPPROTO_ICMP)
-	{	// TODO adjust payload
-		report_icmp(dec);
-		return 0;
-	}	
-	else if (proto == IPPROTO_UDP)
-	{	p_udp_t*	hdr = (p_udp_t*) raw; 
-		raw += sizeof(*hdr);
-
-		dec->proto = proto; 
-		dec->port_src = ntohs(hdr->src);
-		dec->port_dest = ntohs(hdr->dest);
-
-		dec->payload_len -= (raw - raw_org);
-		report_udp(dec);
-		return 0;
-	}
-	else if (proto == IPPROTO_TCP)
-	{	p_tcp_t* 	hdr = (p_tcp_t*)raw; 
-
-		TRC_ADD(&dec->trc, "TCP");
-
-		if ((dec->tcp = calloc(1, sizeof(dec_tcp_t))) == NULL)
-		{	TRC_ADD(&dec->trc, "malloc err:%d", errno);
-			return 0;
-		}
-
-		raw += sizeof(*hdr);
-
-		dec->proto = proto; 
-		dec->port_src = ntohs(hdr->src); 
-		dec->port_dest = ntohs(hdr->dest); 
-
-		dec->payload_len -= (raw - raw_org);
-
-		// save mandatory field
-		dec->tcp->flag = hdr->flag;
-		dec->tcp->seq = ntohl(hdr->seq);
-		dec->tcp->ack = ntohl(hdr->ack_seq);
-		dec->tcp->win = ntohs(hdr->window);
-		dec->tcp->urg = ntohs(hdr->urg_ptr);
-		TRC_ADD(&dec->trc, "S/A/W=%d/%d/%d", dec->tcp->seq, dec->tcp->ack, dec->tcp->win);
-
-		// save optional field
-		if ((hdr->doff * 4) > sizeof(*hdr))
-		{	int				remain = (hdr->doff * 4) - sizeof(*hdr);	
-			p_tcp_opt_t*	opt; 
-
-			for(; remain > 0; )
-			{	opt = (p_tcp_opt_t*) raw; 
-				switch (opt->type)
-				{	case 2 : // MSS 
-						dec->tcp->mss = ntohs(opt->d.d16);
-						TRC_ADD(&dec->trc, "MSS:%d", dec->tcp->mss);
-					break;
-					case 4 : // SACK 
-						dec->tcp->use_sack = 1;
-						TRC_ADD(&dec->trc, "SACK");
-					break;
-					case 3 : // WINDOW SCALE
-						dec->tcp->win_scale = 1 << opt->d.d8;
-						TRC_ADD(&dec->trc, "WS:%d", dec->tcp->win_scale);
-					break;
-				}
-				if (opt->type == 1)	// NOP
-				{	raw += 1;	remain -= 1;	}
-				else
-				{	raw += opt->len; remain -= opt->len;	}
-			}
-		}
-
-		{	flow_tcp_t*	flow; 
-			flow_key_t	key; 
-			int			exist; 
-	
-			flow = flow_add(g_flow_list, flow_make_key(&key, dec), sizeof(flow_tcp_t), 1, &exist);
-			THROW(DROP, flow == NULL);
-			
-			if (exist == 0)	// init vars if newly added
-			{	flow->ambiguous_src = 1; 	flow->step_open = flow->step_close = 0;	}
-
-			if (dec->flag & TCP_F_SYN_ACK)
-/* asd
-			{	int		flag = dec->tcp->flag & (TCP_F_SYN | TCP_F_ACK);	
-
-				if (flag == TCP_F_SYN)
-				{	flow->ambiguous_src = 0;
-					flow_step |= TCP_F_SYN;
-					flow->ip_src = dec->ip_src;		flow->port_src = dec->port_src; 
-					flow->ip_dest = dec->ip_dest;	flow->port_dest = dec->port_dest; 
-				}
-				if (flag == (TCP_F_SYN | TCP_F_ACK))
-				{	flow->ip_src = dec->ip_dest;	flow->port_src = dec->port_dest; 
-					flow->ip_dest = dec->ip_src;	flow->port_dest = dec->port_src; 
-					flow->ambiguous_src = 0;
-				}
-			}
-*/
-			else
-			{	LOG("exist");	}
-		}
-
-		// TODO check control & payload & any optional.. 
-		report_tcp(dec);
-
-		// decode_t p_tcp_t
-
-		return 0;
-	}
+	LOG("-----------------------------------");
+	LOG("client:%c, step_open:%x, step_close:%x", flow->client, flow->step_open, flow->step_close);
+	if (flow->client == 'l')
+	{	side[0] = &flow->low;	side[1] = &flow->hi;	}
 	else
-	{	dec->proto = proto; 	
-		report_unknown_l4(dec);
-		return 0;
-	}
+	{	side[0] = &flow->hi;	side[1] = &flow->low;	}
 
-CATCH(DROP);
-	return -1;
-}
+	sprintf(str1, "%s:%d", zl_ip_print(&side[0]->ip_port.ip), side[0]->ip_port.port);
+	sprintf(str2, "%s:%d", zl_ip_print(&side[1]->ip_port.ip), side[1]->ip_port.port);
+	LOG("IP    : %32s %32s", str1, str2);
 
-int decode_l3(decode_t* dec, int* next, const uint8_t* raw)
-{	const uint8_t* 	raw_org = raw; 
-	int				family = (*next);	
- 
-	if (family == ETHERTYPE_ARP)
-	{	p_arp_t*	ah = (p_arp_t*)raw; 
-		raw += sizeof(*ah);
+	sprintf(str1, "%d/%d", side[0]->init_seq, side[0]->last_ack);
+	sprintf(str2, "%d/%d", side[1]->init_seq, side[1]->last_ack);
+	LOG("S/A   : %32s %32s", str1, str2);
+
+	sprintf(str1, "%d/%d/%d", side[0]->init_win<<side[0]->win_scale, side[0]->init_mss, side[0]->init_sack);
+	sprintf(str2, "%d/%d/%d", side[1]->init_win<<side[1]->win_scale, side[1]->init_mss, side[1]->init_sack);
+	LOG("W/M/S  : %32s %32s", str1, str2);
 	
-		zl_ip_set_ip4(&dec->ip_src, ntohl(ah->src_ip));
-		zl_ip_set_ip4(&dec->ip_dest, ntohl(ah->dest_ip));
-
-		dec->payload_len -= (raw - raw_org);
-		report_arp(dec);
-		
-		return 0; 
-	}
-	else if (family == ETHERTYPE_IP)
-	{	p_ip4_t*	iph = (p_ip4_t*)raw; 
-		raw += sizeof (*iph);
-
-		zl_ip_set_ip4(&dec->ip_src, ntohl(iph->src)); 
-		zl_ip_set_ip4(&dec->ip_dest, ntohl(iph->dest));
-
-		(*next) = iph->proto;
-
-		return (raw - raw_org);
-	}
-	else if (family == ETHERTYPE_IPV6)	
-	{	p_ip6_t*	iph = (p_ip6_t*)raw;
-		raw += sizeof (*iph);
-
-		zl_ip_set_ip6(&dec->ip_src, &iph->src); 
-		zl_ip_set_ip6(&dec->ip_dest, &iph->dest);
-
-		// TODO process optional header
-
-		dec->payload_len -= (raw - raw_org);
-		report_ipv6(dec);
-
-		return 0;
-	}
-	else
-	{	report_unknown_l3(dec);
-		return 0;
-	}	
 }
 
-int decode_l2(decode_t* dec, int* next, const uint8_t* raw)
-{	const uint8_t*	raw_org = raw;	
-	p_ether_t*		eh = (p_ether_t*)raw; 
-	uint16_t		family;
-
-	raw += sizeof(*eh);
-	family = ntohs(eh->proto);
-
-	// check VLAN
-	if (family == ETHERTYPE_VLAN)
-	{	p_vlan_t* vh = (p_vlan_t*)raw; 
-		raw += sizeof(*vh);
-
-		dec->vlan = ntohs(vh->vlan);
-		TRC_ADD(&dec->trc, "VLAN:%d", dec->vlan);
-		family = ntohs(vh->proto);
-	}
-	else
-	{	dec->vlan = 0;	}
-
-	(*next) = family;
-	
-	return raw - raw_org;
-}
-
-void decode_pkt(struct pcap_pkthdr* hdr, const uint8_t* raw)
+void parse(struct pcap_pkthdr* hdr, const uint8_t* raw)
 {	const uint8_t*	raw_org = raw; 	
 	decode_t		dec; 
 	int				len; 
@@ -396,21 +364,69 @@ void decode_pkt(struct pcap_pkthdr* hdr, const uint8_t* raw)
 	// adjust DLT header length 
 	raw += g_dlt_offset; 	
 
-	// check VLAN & L2 header
-	if ((len = decode_l2(&dec, &next, raw)) <= 0)
-	{	return;	}
+	if (decode_l4(&dec, raw, hdr->caplen) < 0)
+	{	ERR("%s %s:%d -> %s:%d %s", __func__, 
+			zl_ip_print(&dec.src.ip), dec.src.port, 
+			zl_ip_print(&dec.dest.ip), dec.dest.port, 
+			dec.trc.d);
+	}	
+	LOG("%s %s:%d -> %s:%d %s", __func__, 
+		zl_ip_print(&dec.src.ip), dec.src.port, 
+		zl_ip_print(&dec.dest.ip), dec.dest.port, 
+		dec.trc.d);
 
-	raw += len; 
-	dec.payload_len -= len; 
 
-	// check L3 & IP layer
-	if ((len = decode_l3(&dec, &next, raw)) <= 0)
-	{	return;	}
+	if (dec.app == APP_TCP)
+	{	flow_key_t	key; 
+		flow_tcp_t*	flow; 
+		int			exist;
 
-	raw += len; 
-	dec.payload_len -= len;
-	decode_l4(&dec, &next, raw);
+		flow = flow_add(g_flow_list, flow_make_key(&key, &dec), sizeof(*flow), 1, &exist);
+		if (exist == 0)	
+		{	memset(flow, 0, sizeof(*flow));	
+
+			flow->app = APP_TCP;
+			// fill IP & Port
+			if (dec.src.ip.v4 < dec.dest.ip.v4)
+			{	flow->low.ip_port = dec.src;	flow->hi.ip_port = dec.dest; }
+			else
+			{	flow->low.ip_port = dec.dest;	flow->hi.ip_port = dec.src; }
+			
+			// determine side
+			if ((dec.tcp.flag & TCP_F_SYN_ACK) == TCP_F_SYN)
+			{	if (dec.src.ip.v4 < dec.dest.ip.v4)	{	flow->client = 'l'; }
+				else								{	flow->client = 'h';	}
+			}
+			if ((dec.tcp.flag & TCP_F_SYN_ACK) == TCP_F_SYN_ACK)
+			{	if (dec.src.ip.v4 < dec.dest.ip.v4) {	flow->client = 'h';	}
+				else								{	flow->client = 'l';	}
+			}
+			else
+			{	flow->client = 0;	}
+		}
+
+		if (dec.tcp.flag & TCP_F_SYN_ACK)
+		{	if ((flow->step_open & TCP_F_SYN_ACK) != TCP_F_SYN_ACK)
+			{	struct flow_tcp_side_t* side;
+				if ((dec.tcp.flag & TCP_F_SYN_ACK) == TCP_F_SYN)				
+				{	side = (flow->client == 'l') ? &flow->low : &flow->hi;	flow->step_open |= TCP_F_SYN;	}
+				else
+				{	side = (flow->client == 'l') ? &flow->hi : &flow->low; flow->step_open |= TCP_F_ACK;	}
+
+				side->init_seq = dec.tcp.seq;
+				side->init_win = dec.tcp.win; 
+				side->init_mss = dec.tcp.mss; 
+				side->init_sack = dec.tcp.use_sack;
+				side->win_scale = dec.tcp.win_scale;
+			}
+			else	// duplicated SYN | SYN_ACK
+			{	LOG("duplicated");
+			}
+		}
+		dump_flow_tcp(flow);
+	}
 }
+
 
 /* ---------- pcap related 
  */
@@ -580,7 +596,7 @@ int main(int argc, char* argv[])
 		struct pcap_pkthdr	pcap_hdr;
 
 		if ((pcap_raw = pcap_next(pc, &pcap_hdr)) != NULL)
-		{	decode_pkt(&pcap_hdr, pcap_raw);	
+		{	parse(&pcap_hdr, pcap_raw);	
 			total_read++;	cur_read++;
 		}
 		else	// get system time if read timeout
