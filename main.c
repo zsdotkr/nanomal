@@ -30,6 +30,7 @@ int			g_stat_intv;
 int			g_dlt_offset;		// pcap datalink header length
 
 char*		g_flow_list;
+int			g_pkt_id; 	// debugging 
 
 // ------------------------------------------------
 // -------------------- decode --------------------
@@ -43,6 +44,7 @@ typedef struct
 #define TRC_ADD(trc, fmt, y...) \
     {   (trc)->pos += snprintf(&(trc)->d[(trc)->pos], sizeof((trc)->d) - (trc)->pos, fmt " ", ##y); \
     }
+#define TRC_INIT(trc)	{	(trc)->pos = 0; (trc)->d[0] = 0;	}
 
 typedef struct 
 {	zl_ip_t			ip; 
@@ -82,10 +84,10 @@ typedef struct
 char* tcp_flag_to_str(int flag, char* ret)
 {	
 	ret[0] = (flag & TCP_F_SYN) ? 'S' : '.' ; 
-	ret[1] = (flag & TCP_F_FIN) ? 'F' : '.' ; 
-	ret[2] = (flag & TCP_F_RST) ? 'R' : '.' ; 
-	ret[3] = (flag & TCP_F_ACK) ? 'A' : '.' ; 
-	ret[4] = (flag & TCP_F_PSH) ? 'P' : '.' ; 
+	ret[1] = (flag & TCP_F_ACK) ? 'A' : '.' ; 
+	ret[2] = (flag & TCP_F_PSH) ? 'P' : '.' ; 
+	ret[3] = (flag & TCP_F_FIN) ? 'F' : '.' ; 
+	ret[4] = (flag & TCP_F_RST) ? 'R' : '.' ; 
 	ret[5] = (flag & TCP_F_URG) ? 'U' : '.' ; 
 	ret[6] = (flag & TCP_F_ECN) ? 'E' : '.' ; 
 	ret[7] = (flag & TCP_F_CWR) ? 'C' : '.' ; 
@@ -294,14 +296,18 @@ typedef struct
 	#define TCP_SETUP_SYN_ACK		2
 	#define TCP_SETUP_SEQ			4
 
+	char			closer;	// 'l' or 'h'
 	char			setup_close;	// TODO RST|FIN|ACK
+	#define TCP_SWETUP_FIN			1
+	#define TCP_SETUP_FIN_ACK		2
+	#define TCP_SETUP_FIN_ACK_ACK	4
 
 	int				evt;			// TCP_EVT_xxx
 	#define TCP_EVT_ZERO_WIN		1
 	#define TCP_EVT_ZERO_WIN_PROBE	2
 
 	traf_t			traf_low, traf_hi;
-	trc_t			trc;
+	// trc_t			trc_l, trc_r;
 } flow_tcp_t;
 
 typedef struct 
@@ -404,9 +410,9 @@ void dump_flow_tcp(flow_tcp_t* flow, int opt)
 			SN(sv->seq_n), SN(sv->seq_a), SN(sv->init_seq));
 		DBG("SEQ N/A/I : %32s %32s", str1, str2);
 
-		sprintf(str1, "%d", cl->inflight);
-		sprintf(str2, "%d", sv->inflight);
-		DBG("F         : %32s %32s", str1, str2);
+		sprintf(str1, "%d / %d", cl->inflight, cl->win);
+		sprintf(str2, "%d / %d", sv->inflight, sv->win);
+		DBG("F/W       : %32s %32s", str1, str2);
 	}
 }
 
@@ -414,6 +420,10 @@ int parse_tcp(decode_t* dec)
 {	dec_tcp_t*	dtcp = &dec->tcp;
 	flow_tcp_t*	flow; 
 	struct flow_tcp_side_t	*my, *peer;
+	trc_t*		trc_lr;
+	trc_t		trc_d, trc_l, trc_r;
+
+	TRC_INIT(&trc_l); TRC_INIT(&trc_r);	TRC_INIT(&trc_d);
 
 	// get flow
 	{	flow_key_t	key; 
@@ -441,8 +451,36 @@ int parse_tcp(decode_t* dec)
 			}
 			else
 			{	flow->client = 'l';	}
+			TRC_ADD(&trc_d, "NEW");
 		}
 	}
+
+	TRC_ADD(&trc_l, "%3d [T", g_pkt_id);
+	if (flow->client == 'l')
+	{	if (memcmp(&dec->src.ip, &flow->low.ip_port.ip, sizeof(dec->src.ip)) == 0)
+		{	TRC_ADD(&trc_l, "%d/%d]", flow->low.ip_port.port, flow->hi.ip_port.port);	
+			// TRC_ADD(&flow->trc_c, "C > S");
+			trc_lr = &trc_l;
+		}
+		else
+		{	TRC_ADD(&trc_l, "%d/%d]", flow->hi.ip_port.port, flow->low.ip_port.port);	
+			// TRC_ADD(&flow->trc_c, "S > C");
+			trc_lr = &trc_r;
+		}
+	}	
+	else
+	{	if (memcmp(&dec->src.ip, &flow->hi.ip_port.ip, sizeof(dec->src.ip)) == 0)
+		{	TRC_ADD(&trc_l, "%d/%d]", flow->hi.ip_port.port, flow->low.ip_port.port);	
+			// TRC_ADD(&flow->trc_c, "C > S");
+			trc_lr = &trc_l;
+		}
+		else
+		{	TRC_ADD(&trc_l, "%d/%d]", flow->low.ip_port.port, flow->hi.ip_port.port);	
+			// TRC_ADD(&flow->trc_c, "S > C");
+			trc_lr = &trc_r;
+		}
+	}
+	TRC_ADD(&trc_l, "%s", tcp_flag_print(dtcp->flag));
 
 	// get my & peer flow 
 	if (dec->src.ip.v4 < dec->dest.ip.v4)	{	my = &flow->low;	peer = &flow->hi;	}
@@ -456,12 +494,16 @@ int parse_tcp(decode_t* dec)
 				return 0;
 			}
 			else
-			{	flow->setup_open |= TCP_SETUP_SYN;
-				
-				my->init_win = dtcp->win; 
+			{	my->init_win = dtcp->win; 
 				my->init_mss = dtcp->mss; 
 				my->init_sack = dtcp->use_sack;
 				my->win_scale = dtcp->win_scale;
+				my->inflight = 1;
+
+				my->init_seq = dtcp->seq; 
+				my->seq_n = dtcp->seq+1; 
+				my->seq_a = dtcp->seq;
+				flow->setup_open |= TCP_SETUP_SYN;
 			}
 		}
 		else if ((dtcp->flag & TCP_F_SYN_ACK) == TCP_F_SYN_ACK)
@@ -476,47 +518,78 @@ int parse_tcp(decode_t* dec)
 				my->init_mss = dtcp->mss; 
 				my->init_sack = dtcp->use_sack;
 				my->win_scale = dtcp->win_scale;
+				my->inflight = 1;
+
+				my->init_seq = dtcp->seq; 
+				my->seq_n = dtcp->seq + 1; // ?? 
+				my->seq_a = dtcp->seq;
+
 				flow->setup_open |= TCP_SETUP_SEQ;
+				TRC_ADD(&trc_d, "FIX");
 			}
 		}
 		else
-		{	flow->setup_open |= TCP_SETUP_SEQ;
+		{	
+			my->init_seq = dtcp->seq;
+			my->seq_n = my->init_seq+1; 
+			my->seq_a = my->init_seq;
+
+			peer->init_seq = dtcp->ack-1; 
+			peer->seq_n = peer->init_seq+1; 
+			peer->seq_a = peer->init_seq;
+
+			flow->setup_open |= TCP_SETUP_SEQ;
+			TRC_ADD(&trc_d, "FIX");
 		}
-
-		my->init_seq = dtcp->seq;
-		my->seq_n = my->init_seq+1; 
-		my->seq_a = my->init_seq;
-
-		peer->init_seq = dtcp->ack-1; 
-		peer->seq_n = peer->init_seq+1; 
-		peer->seq_a = peer->init_seq;
-
-		// if (flow->setup_open & TCP_SETUP_SEQ)	dump_flow_tcp(flow, -1);	
 	}
 
 	// update window
 	my->win = dtcp->win << my->win_scale;
-	// update seq_n 
-	my->seq_n += dec->payload_len;
-	my->inflight += dec->payload_len;
 
-	// process ACK here
-	if (dtcp->flag & TCP_F_ACK)
-	{	if (GT_SEQ(dtcp->ack, peer->seq_n))
-		{	ERR("packet lost ??, ACK:%d, SEQ:%d", SN(dtcp->ack), SN(peer->seq_n));	// TDOO
+	TRC_ADD(trc_lr, "S:%d A:%d W:%d [%d]", dtcp->seq - my->init_seq, dtcp->ack - peer->init_seq, 
+		my->win, dec->payload_len);
+
+	// update seq_n 
+	if (dec->payload_len)	// TODO ?? 
+	{	if (LT_SEQ(dtcp->seq, my->seq_n))
+		{	TRC_ADD(&trc_d, "retransmit ??");	}
+		else if (dtcp->seq == my->seq_n)
+		{	my->seq_n += dec->payload_len;
+			my->inflight += dec->payload_len;
 		}
-		else if (dtcp->ack == peer->seq_n)
-		{	peer->inflight = 0;
-			peer->seq_a = dtcp->ack;
+		else
+		{	TRC_ADD(&trc_d, "packet lost ??, adjust");
+			my->seq_n = dtcp->seq;
+			my->inflight =  my->seq_n - my->seq_a;	
 		}
-		else	// dtcp->ack < peer->seq_n
-		{	int		diff = peer->seq_n - dtcp->ack;
-			peer->inflight -= diff;
-			peer->seq_a = dtcp->ack;
-		}
-		dump_flow_tcp(flow, 2);
 	}
 
+	// process FIN
+	if (dtcp->flag & TCP_F_FIN)
+	{	if (flow->closer == 0)	// if first close
+		{	// here	
+		}	
+	}
+
+	// process ACK 
+	if (dtcp->flag & TCP_F_ACK)
+	{	if (GT_SEQ(dtcp->ack, peer->seq_n))
+		{	
+			TRC_ADD(&trc_d, "packet lost ??");	// TODO
+		}
+		else if (GE_SEQ(dtcp->ack, peer->seq_a))
+		{	int	diff = dtcp->ack - peer->seq_a;
+			peer->inflight -= diff; 
+			peer->seq_a = dtcp->ack;
+		}
+		else	// dtcp->ack <= peer->seq_a
+		{	TRC_ADD(&trc_d, "duplicated ack??");
+		}
+		// dump_flow_tcp(flow, 2);
+	}
+
+	LOG("%-55s %c %s %s %s", trc_l.d, (trc_lr == &trc_l) ? '>' : '<', trc_r.d, 
+		(trc_d.d[0]) ? "##" : "", trc_d.d);
 /*
 	// zero window
 	if (my->win == 0)	
@@ -530,7 +603,7 @@ int parse_tcp(decode_t* dec)
 	// LOST PACKET
 
 
-	// check ack here
+	// check ack 
 	if (dec->tcp.flag & TCP_F_ACK)
 	{		
 		if ((flow->setup_open & TCP_SETUP_SEQ) == 0)
@@ -568,11 +641,15 @@ void parse(struct pcap_pkthdr* hdr, const uint8_t* raw)
 			zl_ip_print(&dec.dest.ip), dec.dest.port, 
 			dec.trc.d);
 	}	
-	LOG("%s:%d -> %s:%d %s %s", 
-		zl_ip_print(&dec.src.ip), dec.src.port, 
-		zl_ip_print(&dec.dest.ip), dec.dest.port, 
-		dec.trc.d, dec.trc_o.d);
+/*
+	LOG("%2d) %d > %d %s %s [%s %s]", id++, 
+		dec.src.port, dec.dest.port, 
+		dec.trc.d, dec.trc_o.d, 
+		zl_ip_print(&dec.src.ip), 
+		zl_ip_print(&dec.dest.ip));
+*/		
 
+	g_pkt_id++;
 
 	if (dec.app == APP_TCP)
 	{	parse_tcp(&dec);	}
@@ -743,7 +820,7 @@ int main(int argc, char* argv[])
 
 	g_flow_list = sklist_create(0);
 
-	for(cur_read = 0, total_read = 0; total_read < 10;)
+	for(cur_read = 0, total_read = 0; total_read < 30;)
 	{	const u_char*		pcap_raw; // raw packet data 
 		struct pcap_pkthdr	pcap_hdr;
 
@@ -775,14 +852,14 @@ int main(int argc, char* argv[])
 								ps.ps_drop, ps.ps_ifdrop);
 				}
 				
-				LOG("%s %s", timebuf, out);
+				// LOG("%s %s", timebuf, out);
 
 				last_stat_time.tv_sec = pcap_hdr.ts.tv_sec;
 				cur_read = 0;
 			}
 		}
 	}		
-	LOG("End");
+	LOG("End (total %zd pkts)", total_read);
 	pcap_close(pc);
 
 	return 0;
