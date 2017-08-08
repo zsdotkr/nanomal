@@ -289,6 +289,8 @@ typedef struct
 		int			win_scale;	
 
 	} low, hi; 
+	struct flow_tcp_side_t* cl;	// client
+	struct flow_tcp_side_t*	sv;	// server
 
 	char			client;	// 'l' (low), 'h' (high), 0x00 (unknown)
 	char			setup_open;	// TCP_SETUP_xxx
@@ -298,9 +300,12 @@ typedef struct
 
 	char			closer;	// 'l' or 'h'
 	char			setup_close;	// TODO RST|FIN|ACK
-	#define TCP_SWETUP_FIN			1
-	#define TCP_SETUP_FIN_ACK		2
-	#define TCP_SETUP_FIN_ACK_ACK	4
+	#define TCP_SETUP_FIN_LOW		(1 << 0)
+	#define TCP_SETUP_FIN_HI		(1 << 1)
+	#define TCP_SETUP_FIN_ACK_LOW	(1 << 2)
+	#define TCP_SETUP_FIN_ACK_HI	(1 << 3)
+	#define TCP_SETUP_RST_LOW		(1 << 4)
+	#define TCP_SETUP_RST_HI		(1 << 5)
 
 	int				evt;			// TCP_EVT_xxx
 	#define TCP_EVT_ZERO_WIN		1
@@ -416,6 +421,8 @@ void dump_flow_tcp(flow_tcp_t* flow, int opt)
 	}
 }
 
+#define EQUAL_IP(x, y)	(memcmp(x, y, sizeof(*x)) == 0)
+
 int parse_tcp(decode_t* dec)
 {	dec_tcp_t*	dtcp = &dec->tcp;
 	flow_tcp_t*	flow; 
@@ -440,51 +447,47 @@ int parse_tcp(decode_t* dec)
 			else
 			{	flow->low.ip_port = dec->dest;	flow->hi.ip_port = dec->src; }
 	
-			// determine side
+			// dtermine side 2 here
 			if ((dtcp->flag & TCP_F_SYN_ACK) == TCP_F_SYN)
-			{	if (dec->src.ip.v4 < dec->dest.ip.v4)	{	flow->client = 'l'; }
-				else								{	flow->client = 'h';	}
+			{	if (EQUAL_IP(&dec->src.ip, &flow->low.ip_port.ip) && 
+					(dec->src.port == flow->low.ip_port.port))
+				{	flow->cl = &flow->low;	
+					flow->sv = &flow->hi;
+				}
+				else
+				{	flow->cl = &flow->hi; 
+					flow->sv = &flow->low;
+				}
 			}
 			else if ((dtcp->flag & TCP_F_SYN_ACK) == TCP_F_SYN_ACK)
-			{	if (dec->src.ip.v4 < dec->dest.ip.v4) {	flow->client = 'h';	}
-				else								{	flow->client = 'l';	}
+			{	if (EQUAL_IP(&dec->src.ip, &flow->low.ip_port.ip) && 
+					(dec->src.port == flow->low.ip_port.port))
+				{	flow->cl = &flow->hi;	
+					flow->sv = &flow->low;
+				}
+				else
+				{	flow->cl = &flow->low; 
+					flow->sv = &flow->hi;
+				}
 			}
 			else
-			{	flow->client = 'l';	}
+			{	flow->cl = &flow->low; 
+				flow->sv = &flow->hi;
+			}
 			TRC_ADD(&trc_d, "NEW");
 		}
 	}
 
-	TRC_ADD(&trc_l, "%3d [T", g_pkt_id);
-	if (flow->client == 'l')
-	{	if (memcmp(&dec->src.ip, &flow->low.ip_port.ip, sizeof(dec->src.ip)) == 0)
-		{	TRC_ADD(&trc_l, "%d/%d]", flow->low.ip_port.port, flow->hi.ip_port.port);	
-			// TRC_ADD(&flow->trc_c, "C > S");
-			trc_lr = &trc_l;
-		}
-		else
-		{	TRC_ADD(&trc_l, "%d/%d]", flow->hi.ip_port.port, flow->low.ip_port.port);	
-			// TRC_ADD(&flow->trc_c, "S > C");
-			trc_lr = &trc_r;
-		}
-	}	
-	else
-	{	if (memcmp(&dec->src.ip, &flow->hi.ip_port.ip, sizeof(dec->src.ip)) == 0)
-		{	TRC_ADD(&trc_l, "%d/%d]", flow->hi.ip_port.port, flow->low.ip_port.port);	
-			// TRC_ADD(&flow->trc_c, "C > S");
-			trc_lr = &trc_l;
-		}
-		else
-		{	TRC_ADD(&trc_l, "%d/%d]", flow->low.ip_port.port, flow->hi.ip_port.port);	
-			// TRC_ADD(&flow->trc_c, "S > C");
-			trc_lr = &trc_r;
-		}
-	}
+
+	TRC_ADD(&trc_l, "%3d [T %d/%d]", g_pkt_id, flow->cl->ip_port.port, flow->sv->ip_port.port);
 	TRC_ADD(&trc_l, "%s", tcp_flag_print(dtcp->flag));
 
 	// get my & peer flow 
-	if (dec->src.ip.v4 < dec->dest.ip.v4)	{	my = &flow->low;	peer = &flow->hi;	}
-	else									{	my = &flow->hi;		peer = &flow->low;	}
+	if (EQUAL_IP(&dec->src.ip, &flow->cl->ip_port.ip) && 
+		(dec->src.port == flow->cl->ip_port.port))
+	{	my = flow->cl;	peer = flow->sv;	trc_lr = &trc_l; 	}
+	else
+	{	my = flow->sv;	peer = flow->cl;	trc_lr = &trc_r;	}
 
 	// setup sequence 
 	if ((flow->setup_open & TCP_SETUP_SEQ) == 0)
@@ -568,7 +571,22 @@ int parse_tcp(decode_t* dec)
 	if (dtcp->flag & TCP_F_FIN)
 	{	if (flow->closer == 0)	// if first close
 		{	// here	
+			flow->closer = (my == &flow->low) ? 'l' : 'h';
 		}	
+		
+		if (my == &flow->low)
+		{	if (flow->setup_close & TCP_SETUP_FIN_LOW)
+			{	TRC_ADD(&trc_d, "Already FIN_LOW");	}
+			else
+			{	flow->setup_close |= TCP_SETUP_FIN_LOW;	}
+		}
+		else	// high side
+		{	if (flow->setup_close & TCP_SETUP_FIN_HI)
+			{	TRC_ADD(&trc_d, "Already FIN_HI");	}
+			else
+			{	flow->setup_close |= TCP_SETUP_FIN_HI;	}
+		}
+		my->seq_n = dtcp->seq + 1;
 	}
 
 	// process ACK 
@@ -581,6 +599,21 @@ int parse_tcp(decode_t* dec)
 		{	int	diff = dtcp->ack - peer->seq_a;
 			peer->inflight -= diff; 
 			peer->seq_a = dtcp->ack;
+
+			if (dtcp->ack == peer->seq_n)
+			{	
+				if ((my == &flow->low) && (flow->setup_close & TCP_SETUP_FIN_LOW))
+				{	flow->setup_close |= TCP_SETUP_FIN_ACK_LOW;	}
+				if ((my == &flow->hi) && (flow->setup_close & TCP_SETUP_FIN_HI))
+				{	flow->setup_close |= TCP_SETUP_FIN_ACK_HI;	}
+				int	mask = TCP_SETUP_FIN_LOW | TCP_SETUP_FIN_HI | 
+							TCP_SETUP_FIN_ACK_LOW | TCP_SETUP_FIN_ACK_HI;
+				if ((flow->setup_close & mask) == mask)
+				{	
+					if ((my->seq_n == my->seq_a) && (peer->seq_a == peer->seq_n))
+					{	TRC_ADD(&trc_d, "CLOSE");	}
+				}
+			}
 		}
 		else	// dtcp->ack <= peer->seq_a
 		{	TRC_ADD(&trc_d, "duplicated ack??");
