@@ -79,7 +79,7 @@ int			zl_ip_is_v4(zl_ip_t* ptr);
 void		zl_ip_set_ip4(zl_ip_t* ptr, uint32_t ip);
 void		zl_ip_set_ip6(zl_ip_t* ptr, void* ip);
 char* 		zl_ip_to_str(zl_ip_t* ptr, char* ret, int ret_len);
-#define 	zl_ip_print(ptr)	zl_ip_to_str(ptr, alloca(40), 40)
+#define 	zl_ip_print(ptr)	zl_ip_to_str(&(ptr), alloca(40), 40)
 
 // common.c
 int			zl_init();
