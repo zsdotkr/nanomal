@@ -65,9 +65,9 @@ typedef struct
 typedef struct 
 {	trc_t			trc;	
 	trc_t			trc_o;	
-	int				pkt_len;	// total length of packet
-	int				payload_len;// payload (L5) length
-	int				pad_len;	
+	int				pkt_len;	// total length of packet (excluding pad)
+	int				app_len;	// length of application(upper of UDP/TCP)
+	int				pad_len;	// ((pkt_len <= 64) && (pad_len == 0)) = local host
 
 	int				vlan;
 	
@@ -82,16 +82,20 @@ typedef struct
 } decode_t;
 
 char* tcp_flag_to_str(int flag, char* ret)
-{	
+{	int		pos;
+
 	ret[0] = (flag & TCP_F_SYN) ? 'S' : '.' ; 
 	ret[1] = (flag & TCP_F_ACK) ? 'A' : '.' ; 
 	ret[2] = (flag & TCP_F_PSH) ? 'P' : '.' ; 
 	ret[3] = (flag & TCP_F_FIN) ? 'F' : '.' ; 
 	ret[4] = (flag & TCP_F_RST) ? 'R' : '.' ; 
-	ret[5] = (flag & TCP_F_URG) ? 'U' : '.' ; 
-	ret[6] = (flag & TCP_F_ECN) ? 'E' : '.' ; 
-	ret[7] = (flag & TCP_F_CWR) ? 'C' : '.' ; 
-	ret[8] = 0;
+
+	pos = 5;
+
+	if (flag & TCP_F_URG)	{	ret[pos++] = 'U';	}
+	if (flag & TCP_F_ECN)	{	ret[pos++] = 'E';	}
+	if (flag & TCP_F_CWR)	{	ret[pos++] = 'C';	}
+	ret[pos] = 0;
 	
 	return ret;
 }
@@ -143,8 +147,11 @@ int decode_l4(decode_t* dec, const uint8_t* raw, int cap_len)
 			zl_ip_set_ip4(&dec->src.ip, ntohl(iph->src)); 
 			zl_ip_set_ip4(&dec->dest.ip, ntohl(iph->dest));
 
-			dec->payload_len = ntohs(iph->tot_len) - sizeof(*iph);
-	
+			dec->app_len = ntohs(iph->tot_len) - sizeof(*iph);
+			// calculate & extract padding
+			dec->pad_len = dec->pkt_len - (dec->app_len + (raw - raw_org));
+			dec->pkt_len -= dec->pad_len;
+			
 			next_p = iph->proto;
 		}
 		else if (next_p == ETHERTYPE_IPV6)	
@@ -241,8 +248,8 @@ int decode_l4(decode_t* dec, const uint8_t* raw, int cap_len)
 					{	raw += opt->len; remain -= opt->len;	}
 				}
 			}
-			dec->payload_len -= (raw - (uint8_t*)hdr);
-			TRC_ADD(dec->trc, "[%d]", dec->payload_len);
+			dec->app_len -= (raw - (uint8_t*)hdr);
+			TRC_ADD(dec->trc, "[%d]", dec->app_len);
 			dec->app = APP_TCP; 
 			return 0;
 		}
@@ -269,11 +276,10 @@ CATCH(ERR)
 #define SN(x)			((x) % 10000)
 
 typedef struct 
-{	struct 
-	{	int64_t	byte, pkt; 	// out
-		int64_t	byte_dup, pkt_dup;	// out 
-	} lo, hi; 	
-} traf_t;	// traffic 
+{	int				pkt;	
+	int64_t			raw;		// bytes count of whole packet
+	int64_t			payload;	// bytes count of payload ONLY
+} tcp_stat_t;	
 
 typedef struct 
 {	int				app;	// APP_xxx	
@@ -290,6 +296,8 @@ typedef struct
 		uint32_t	seq_a; 		// sequence acked
 		uint32_t	win;		// current window
 		int			inflight;	// inflight bytes
+
+		tcp_stat_t	stat;
 	} low, hi; 
 
 	struct flow_tcp_side_t* cl;	// client side
@@ -302,21 +310,21 @@ typedef struct
 	#define TCP_P_SEQ_SET		(1 << 2)
 
 	char			closer;		// 'l' (low), 'h' (high), else (unknown)
-	char			closing;	// closing flag, TCP_P_xxx
+	uint8_t			closing;	// closing flag, TCP_P_xxx
 	#define TCP_P_FIN_LOW		(1 << 0)
 	#define TCP_P_FIN_HI		(1 << 1)
 	#define TCP_P_FIN_ACK_LOW	(1 << 2)
 	#define TCP_P_FIN_ACK_HI	(1 << 3)
-	#define TCP_P_RST_LOW		(1 << 4)
-	#define TCP_P_RST_HI		(1 << 5)
+	#define TCP_P_FIN_CLOSE		(1 << 4)
+	#define TCP_P_RST_LOW		(1 << 5)
+	#define TCP_P_RST_HI		(1 << 6)
+	#define TCP_P_RST_CLOSE		(1 << 7)
 	#define TCP_P_FIN_ALL		(TCP_P_FIN_LOW|TCP_P_FIN_HI|TCP_P_FIN_ACK_LOW|TCP_P_FIN_ACK_HI)
 
 	int				evt;			// TCP_EVT_xxx
 	#define TCP_EVT_ZERO_WIN		1
 	#define TCP_EVT_ZERO_WIN_PROBE	2
 
-	traf_t			traf_low, traf_hi;
-	// trc_t			trc_l, trc_r;
 } flow_tcp_t;
 
 typedef struct 
@@ -370,7 +378,7 @@ void* flow_add(char* flow_list, flow_key_t* fkey, int size, int expire_at, int* 
 	{	(*ret) = malloc(size);
 		THROW_L(CLR_ERR, (*ret) == NULL, "malloc2 err(%d)", errno);
 		*exist = 0; 
-		DBG("%s, create new size:%d", __func__, size);
+		// DBG("%s, create new size:%d", __func__, size);
 	}
 	else
 	{	*exist = 1; 
@@ -464,20 +472,36 @@ int parse_tcp(decode_t* dec)
 				else 
 				{	flow->cl = &flow->low;	flow->sv = &flow->hi;	}
 			}
-			else
-			{	flow->cl = &flow->low;	flow->sv = &flow->hi;	}
-			TRC_ADD(trc_d, "OPEN");
+			else	// guess who is client
+			{	
+				if 		((flow->low.ipp.port < 1024) && (flow->hi.ipp.port >= 1024))
+				{	flow->cl = &flow->hi;	flow->sv = &flow->low;	}
+				else if ((flow->low.ipp.port >= 1024) && (flow->hi.ipp.port < 1024))
+				{	flow->cl = &flow->low;	flow->sv = &flow->hi;	}
+				else 
+				{	if (zl_ip_is_private(&flow->low.ipp.ip) && (zl_ip_is_private(&flow->hi.ipp.ip) == 0))
+					{	flow->cl = &flow->low;	flow->sv = &flow->hi;	}
+					else if (zl_ip_is_private(&flow->hi.ipp.ip) && (zl_ip_is_private(&flow->low.ipp.ip) == 0))
+					{	flow->cl = &flow->hi;	flow->sv = &flow->low;	}
+					else	// default I don't who is client
+					{	flow->cl = &flow->low;  flow->sv = &flow->hi;	}
+				}
+			}
+			TRC_ADD(trc_d, "CREATE");
 		}	
 	}
 
 	TRC_ADD(trc_l, "%3d [T %d/%d]", g_pkt_id, flow->cl->ipp.port, flow->sv->ipp.port);
-	TRC_ADD(trc_l, "%s", tcp_flag_print(dtcp->flag));
+	TRC_ADD(trc_l, "[%-3s]", tcp_flag_print(dtcp->flag));
 
 	// get my & peer flow 
 	if (EQUAL_PTR(&dec->src, &flow->cl->ipp))
 	{	my = flow->cl;	peer = flow->sv;	trc_lr = &trc_l; 	}
 	else
 	{	my = flow->sv;	peer = flow->cl;	trc_lr = &trc_r;	}
+
+	my->stat.pkt++;
+	my->stat.raw += dec->pkt_len;
 
 	// setup sequence 
 	if ((flow->opening & TCP_P_SEQ_SET) == 0)
@@ -515,21 +539,21 @@ int parse_tcp(decode_t* dec)
 				my->seq_a = dtcp->seq;
 
 				flow->opening |= (TCP_P_SYN_ACK | TCP_P_SEQ_SET);
-				TRC_ADD(trc_d, "FIX");
+				TRC_ADD(trc_d, "OPEN %x", flow->opening);
 			}
 		}
 		else
 		{	
-			my->seq_b = dtcp->seq;
-			my->seq_n = my->seq_b+1; 
-			my->seq_a = my->seq_b;
+			my->seq_b = dtcp->seq; 
+			my->seq_n = dtcp->seq;// + 1 + dec->app_len;// + 1;
+			my->seq_a = dtcp->seq;
 
-			peer->seq_b = dtcp->ack-1; 
-			peer->seq_n = peer->seq_b+1; 
-			peer->seq_a = peer->seq_b;
+			peer->seq_b = dtcp->ack;// - 1; 
+			peer->seq_n = dtcp->ack;// - dec->app_len;
+			peer->seq_a = dtcp->ack;// - dec->app_len;
 
 			flow->opening |= TCP_P_SEQ_SET;
-			TRC_ADD(trc_d, "FIX");
+			TRC_ADD(trc_d, "FIX %d", flow->opening);
 		}
 	}
 
@@ -539,15 +563,14 @@ int parse_tcp(decode_t* dec)
 	TRC_ADD(*trc_lr, "S:%d A:%d W:%d", dtcp->seq - my->seq_b, 
 		dtcp->ack - peer->seq_b, my->win);
 
-	// process SYN ?? 
-
 	// process payload
-	if (dec->payload_len)	// TODO ?? 
+	if (dec->app_len)	
 	{	if (LT_SEQ(dtcp->seq, my->seq_n))
 		{	TRC_ADD(trc_d, "RETX ?");	}
 		else if (dtcp->seq == my->seq_n)
-		{	my->seq_n += dec->payload_len;
-			my->inflight += dec->payload_len;
+		{	my->seq_n += dec->app_len;
+			my->inflight += dec->app_len;
+			my->stat.payload += dec->app_len;
 		}
 		else
 		{	TRC_ADD(trc_d, "packet lost ??, adjust");
@@ -575,7 +598,24 @@ int parse_tcp(decode_t* dec)
 			{	flow->closing |= TCP_P_FIN_HI;	}
 		}
 		my->seq_n = dtcp->seq + 1;
+	}
 
+	// process RST
+	if (dtcp->flag & TCP_F_RST)
+	{	if (flow->closer == 0)
+		{	flow->closer = (my == &flow->low) ? 'l' : 'h';	}
+
+		int	mask = (my == &flow->low) ? TCP_P_RST_LOW : TCP_P_RST_HI;
+
+		if (flow->closing & mask)
+		{	TRC_ADD(trc_d, "DUP_RST");	}
+		else
+		{	flow->closing |= mask; 
+			if ((flow->closing & (TCP_P_FIN_CLOSE | TCP_P_RST_CLOSE)) == 0)
+			{	flow->closing |= TCP_P_RST_CLOSE;
+				TRC_ADD(trc_d, "CLOSED %x", flow->closing);
+			}
+		}
 	}
 
 	// process ACK 
@@ -602,10 +642,11 @@ int parse_tcp(decode_t* dec)
 
 				if ((flow->closing & TCP_P_FIN_ALL) == TCP_P_FIN_ALL)
 				{	if ((my->seq_n == my->seq_a) && (peer->seq_a == peer->seq_n))
-					{	TRC_ADD(trc_d, "CLOSED");	}
-					else
-					{	TRC_ADD(trc_d, "HALF_CLOSED");	
+					{	flow->closing |= TCP_P_FIN_CLOSE;	
+						TRC_ADD(trc_d, "CLOSED %x", flow->closing);	
 					}
+					else
+					{	TRC_ADD(trc_d, "HALF_CLOSED");	}
 				}
 			}
 		}
@@ -614,17 +655,25 @@ int parse_tcp(decode_t* dec)
 		}
 	}
 
-	TRC_ADD(*trc_lr, "F:%d [%d]", my->inflight, dec->payload_len);
+	TRC_ADD(*trc_lr, "F:%d [%d]", my->inflight, dec->app_len);
 
 	LOG("%-60s %c %s %s %s", trc_l.d, (trc_lr == &trc_l) ? '>' : '<', trc_r.d, 
 		(trc_d.d[0]) ? "##" : "", trc_d.d);
+
+	// print statistics
+	if ((flow->closing & (TCP_P_FIN_CLOSE | TCP_P_RST_CLOSE)))
+	{	DBG("Client Pkts:%5d Bytes:%zd Payload:%zd", 
+			flow->cl->stat.pkt, flow->cl->stat.raw, flow->cl->stat.payload);	
+		DBG("Server Pkts:%5d Bytes:%zd Payload:%zd", 
+			flow->sv->stat.pkt, flow->sv->stat.raw, flow->sv->stat.payload);	
+	}
 /*
 	// zero window
 	if (my->win == 0)	
 	{	flow->evt |= TCP_EVT_ZERO_WIN;	DBG("Zero Window");	}
 
 	// zero window probing
-	if ((dec->payload_len == 1) && (dec->tcp.seq == my->seq_n) && 
+	if ((dec->app_len == 1) && (dec->tcp.seq == my->seq_n) && 
 			(my->win == 0))
 	{	flow->evt |= TCP_EVT_ZERO_WIN_PROBE;	DBG("Zero Window Probing");	}
 
@@ -661,8 +710,7 @@ void parse(struct pcap_pkthdr* hdr, const uint8_t* raw)
 	
 	// initialize length
 	memset(&dec, 0, sizeof(dec));
-	dec.pkt_len = dec.payload_len = (hdr->len - g_dlt_offset);
-	
+	dec.pkt_len = (hdr->len - g_dlt_offset);	// length including pad
 	// adjust DLT header length 
 	raw += g_dlt_offset; 	
 
@@ -851,7 +899,7 @@ int main(int argc, char* argv[])
 
 	g_flow_list = sklist_create(0);
 
-	for(cur_read = 0, total_read = 0; total_read < 30;)
+	for(cur_read = 0, total_read = 0; total_read < 200;)
 	{	const u_char*		pcap_raw; // raw packet data 
 		struct pcap_pkthdr	pcap_hdr;
 

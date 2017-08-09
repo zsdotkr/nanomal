@@ -76,6 +76,7 @@ typedef union
 
 // ip.c
 int			zl_ip_is_v4(zl_ip_t* ptr);
+int			zl_ip_is_private(zl_ip_t* ptr);
 void		zl_ip_set_ip4(zl_ip_t* ptr, uint32_t ip);
 void		zl_ip_set_ip6(zl_ip_t* ptr, void* ip);
 char* 		zl_ip_to_str(zl_ip_t* ptr, char* ret, int ret_len);
