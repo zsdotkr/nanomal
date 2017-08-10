@@ -79,6 +79,12 @@ typedef struct p_ip6_opt_t {
 	// TLV encoded option data follows 
 } __attribute__((packed)) p_ip6_opt_t;
 
+typedef struct p_igmp_t {
+	uint8_t			type;
+	uint8_t			code; 
+	uint32_t		group_ip;	
+} __attribute__ ((packed)) p_igmp_t;
+
 typedef struct p_udp_t {
 	uint16_t		src;
 	uint16_t		dest;

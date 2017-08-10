@@ -9,10 +9,13 @@
 
 typedef enum
 {	APP_ERR = -1, 
+	// IP Layer
 	APP_ARP = 0, 
 	APP_IP4,
 	APP_IP6,
 	APP_ICMP, 
+	APP_IGMP, 
+	// L4 Layer
 	APP_UDP, 
 	APP_TCP,
 	APP_UNKNOWN, 

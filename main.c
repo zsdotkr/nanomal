@@ -101,6 +101,16 @@ char* tcp_flag_to_str(int flag, char* ret)
 }
 #define tcp_flag_print(x)	tcp_flag_to_str(x, alloca(10))
 
+int chk_wellknown_udp(decode_t* dec)
+{	switch (dec->dest.port)
+	{	case 1900:	TRC_ADD(dec->trc, "SSDP");	break;
+		case 5355:	TRC_ADD(dec->trc, "LLMNR");	break;
+		case 137:	TRC_ADD(dec->trc, "NBNS");	break;
+		case 67:	TRC_ADD(dec->trc, "DHCP");	break;
+	}
+	return 0;
+}
+
 int decode_l4(decode_t* dec, const uint8_t* raw, int cap_len)
 {	const uint8_t*	raw_org = raw;
 	const uint8_t*	end = raw_org + cap_len;
@@ -136,13 +146,24 @@ int decode_l4(decode_t* dec, const uint8_t* raw, int cap_len)
 			zl_ip_set_ip4(&dec->dest.ip, ntohl(ah->dest_ip));
 
 			dec->app = APP_ARP;
+			TRC_ADD(dec->trc, "ARP");
+
+			switch(ntohs(ah->opcode))
+			{	case 1 : TRC_ADD(dec->trc, "Req");	break; 
+				case 2 : TRC_ADD(dec->trc, "Res");	break;
+				case 3 : TRC_ADD(dec->trc, "RARP Req");	break;
+				case 4 : TRC_ADD(dec->trc, "RARP Res");	break;
+				default: TRC_ADD(dec->trc, "Unknown(%d)", ah->opcode);	break;
+			}
 
 			return 0; 
 		}
 		else if (next_p == ETHERTYPE_IP)
 		{	p_ip4_t*	iph = (p_ip4_t*)raw; 
-			raw += sizeof (*iph);
+			raw += (iph->ihl << 2);	
 			THROW_L(ERR, raw > end, "too short IP");
+		
+			// skip IP optional header
 	
 			zl_ip_set_ip4(&dec->src.ip, ntohl(iph->src)); 
 			zl_ip_set_ip4(&dec->dest.ip, ntohl(iph->dest));
@@ -162,11 +183,11 @@ int decode_l4(decode_t* dec, const uint8_t* raw, int cap_len)
 			zl_ip_set_ip6(&dec->src.ip, &iph->src); 
 			zl_ip_set_ip6(&dec->dest.ip, &iph->dest);
 
+			next_p = iph->nexthdr;
+
 			// TODO process optional header
 	
 			dec->app = APP_IP6;
-
-			return 0;
 		}
 		else
 		{	dec->app = APP_UNKNOWN;
@@ -183,6 +204,25 @@ int decode_l4(decode_t* dec, const uint8_t* raw, int cap_len)
 			TRC_ADD(dec->trc, "ICMP");
 			return 0;
 		}	
+		else if (next_p == IPPROTO_IGMP)
+		{	p_igmp_t* 	hdr = (p_igmp_t*)raw; 
+			raw += sizeof(&hdr);	
+			THROW_L(ERR, raw > end, "too short IGMP");
+
+			dec->app = APP_IGMP;
+			dec->proto = IPPROTO_IGMP;
+			TRC_ADD(dec->trc, "IGMP");
+
+			switch(hdr->type)
+			{	case 0x11 : TRC_ADD(dec->trc, "Query");	break;
+				case 0x12 : TRC_ADD(dec->trc, "V1 Report");	break;
+				case 0x16 : TRC_ADD(dec->trc, "V2 Report");	break;
+				case 0x17 : TRC_ADD(dec->trc, "Leave");	break;
+				default : TRC_ADD(dec->trc, "Unknown type(%d)", hdr->type);	break;
+			}
+
+			return 0;
+		}
 		else if (next_p == IPPROTO_UDP)
 		{	p_udp_t*	hdr = (p_udp_t*) raw; 
 			raw += sizeof(*hdr);
@@ -194,6 +234,9 @@ int decode_l4(decode_t* dec, const uint8_t* raw, int cap_len)
 
 			dec->app = APP_UDP;
 			TRC_ADD(dec->trc, "UDP");
+
+			chk_wellknown_udp(dec);
+			
 			return 0;
 		}
 		else if (next_p == IPPROTO_TCP)
@@ -208,7 +251,7 @@ int decode_l4(decode_t* dec, const uint8_t* raw, int cap_len)
 			dec->proto = IPPROTO_TCP;
 			dec->src.port = ntohs(hdr->src); 
 			dec->dest.port = ntohs(hdr->dest); 
-// ---
+
 			dec_tcp->flag = hdr->flag;
 			dec_tcp->seq = ntohl(hdr->seq);
 			dec_tcp->ack = ntohl(hdr->ack_seq);
@@ -254,7 +297,8 @@ int decode_l4(decode_t* dec, const uint8_t* raw, int cap_len)
 			return 0;
 		}
 		else
-		{	dec->app = APP_UNKNOWN; 	
+		{	TRC_ADD(dec->trc, "Unknown Proto(%d)", next_p);
+			dec->app = APP_UNKNOWN; 	
 			return 0;
 		}
 	}
@@ -720,15 +764,14 @@ void parse(struct pcap_pkthdr* hdr, const uint8_t* raw)
 			zl_ip_print(dec.dest.ip), dec.dest.port, 
 			dec.trc.d);
 	}	
-/*
-	LOG("%2d) %d > %d %s %s [%s %s]", id++, 
+
+	LOG("%2d) %d > %d %s %s [%s %s]", g_pkt_id, 
 		dec.src.port, dec.dest.port, 
 		dec.trc.d, dec.trc_o.d, 
 		zl_ip_print(dec.src.ip), 
 		zl_ip_print(dec.dest.ip));
-*/		
+		
 
-	g_pkt_id++;
 
 	if (dec.app == APP_TCP)
 	{	parse_tcp(&dec);	}
@@ -904,7 +947,8 @@ int main(int argc, char* argv[])
 		struct pcap_pkthdr	pcap_hdr;
 
 		if ((pcap_raw = pcap_next(pc, &pcap_hdr)) != NULL)
-		{	parse(&pcap_hdr, pcap_raw);	
+		{	g_pkt_id++;
+			parse(&pcap_hdr, pcap_raw);	
 			total_read++;	cur_read++;
 		}
 		else	// get system time if read timeout
