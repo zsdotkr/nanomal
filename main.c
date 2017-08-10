@@ -493,7 +493,7 @@ int parse_tcp(decode_t* dec)
 
 	TRC_ADD(trc_l, "%3d [T %d/%d]", g_pkt_id, flow->cl->ipp.port, flow->sv->ipp.port);
 	TRC_ADD(trc_l, "[%-3s]", tcp_flag_print(dtcp->flag));
-
+	
 	// get my & peer flow 
 	if (EQUAL_PTR(&dec->src, &flow->cl->ipp))
 	{	my = flow->cl;	peer = flow->sv;	trc_lr = &trc_l; 	}
@@ -507,8 +507,7 @@ int parse_tcp(decode_t* dec)
 	if ((flow->opening & TCP_P_SEQ_SET) == 0)
 	{	if ((dtcp->flag & TCP_F_SYN_ACK) == TCP_F_SYN)
 		{	if ((flow->opening & TCP_P_SYN) == TCP_P_SYN)
-			{	TRC_ADD(trc_d, "DUP SYN");
-				return 0;
+			{	TRC_ADD(trc_d, "DUP_SYN");
 			}
 			else
 			{	my->win_b = dtcp->win; 
@@ -525,7 +524,7 @@ int parse_tcp(decode_t* dec)
 		}
 		else if ((dtcp->flag & TCP_F_SYN_ACK) == TCP_F_SYN_ACK)
 		{	if ((flow->opening & TCP_P_SYN_ACK) == TCP_P_SYN_ACK)
-			{	TRC_ADD(trc_d, "DUP SYN_ACK");
+			{	TRC_ADD(trc_d, "DUP_SYN_ACK");
 				return 0;
 			}
 			else
@@ -539,7 +538,7 @@ int parse_tcp(decode_t* dec)
 				my->seq_a = dtcp->seq;
 
 				flow->opening |= (TCP_P_SYN_ACK | TCP_P_SEQ_SET);
-				TRC_ADD(trc_d, "OPEN %x", flow->opening);
+				TRC_ADD(trc_d, "OPEN_%x", flow->opening);
 			}
 		}
 		else
@@ -553,26 +552,39 @@ int parse_tcp(decode_t* dec)
 			peer->seq_a = dtcp->ack;// - dec->app_len;
 
 			flow->opening |= TCP_P_SEQ_SET;
-			TRC_ADD(trc_d, "FIX %d", flow->opening);
+			TRC_ADD(trc_d, "FOPEN_%d", flow->opening);
 		}
 	}
 
-	// update window
-	my->win = dtcp->win << my->win_scale;
-
 	TRC_ADD(*trc_lr, "S:%d A:%d W:%d", dtcp->seq - my->seq_b, 
-		dtcp->ack - peer->seq_b, my->win);
+		dtcp->ack - peer->seq_b, dtcp->win << my->win_scale);
+
+	// check window update
+	if ((dec->app_len == 0) && (dtcp->flag == TCP_F_ACK))
+	{	if (dtcp->ack == peer->seq_a)
+		{	int		diff = (dtcp->win << my->win_scale) - my->win; 
+			if (diff > 0)	TRC_ADD(trc_d, "WIN_UPDATE_%d", diff);	
+		}
+	}
+
+	// check zero window, NOT TESTED
+	if ((dtcp->win == 0) && ((dtcp->flag & TCP_F_RST) == 0))
+	{	TRC_ADD(trc_d, "ZERO_WIN ?");	}
+
+	// zero window probing, NOT TESTED
+	if ((dec->app_len == 1) && (dtcp->seq == my->seq_n) && (peer->win == 0))
+	{	TRC_ADD(trc_d, "ZERO_WIN_PROBE ?");	}
 
 	// process payload
 	if (dec->app_len)	
 	{	if (LT_SEQ(dtcp->seq, my->seq_n))
-		{	TRC_ADD(trc_d, "RETX ?");	}
+		{	TRC_ADD(trc_d, "RETX");	}
 		else if (dtcp->seq == my->seq_n)
 		{	my->seq_n += dec->app_len;
 			my->inflight += dec->app_len;
 			my->stat.payload += dec->app_len;
 		}
-		else
+		else	// NOT TESTED
 		{	TRC_ADD(trc_d, "packet lost ??, adjust");
 			my->seq_n = dtcp->seq;
 			my->inflight =  my->seq_n - my->seq_a;	
@@ -587,13 +599,13 @@ int parse_tcp(decode_t* dec)
 		
 		if (my == &flow->low)
 		{	if (flow->closing & TCP_P_FIN_LOW)
-			{	TRC_ADD(trc_d, "DUP FIN");	}
+			{	TRC_ADD(trc_d, "DUP_FIN");	}
 			else
 			{	flow->closing |= TCP_P_FIN_LOW;	}
 		}
 		else	// high side
 		{	if (flow->closing & TCP_P_FIN_HI)
-			{	TRC_ADD(trc_d, "DUP FIN");	}
+			{	TRC_ADD(trc_d, "DUP_FIN");	}
 			else
 			{	flow->closing |= TCP_P_FIN_HI;	}
 		}
@@ -613,7 +625,7 @@ int parse_tcp(decode_t* dec)
 		{	flow->closing |= mask; 
 			if ((flow->closing & (TCP_P_FIN_CLOSE | TCP_P_RST_CLOSE)) == 0)
 			{	flow->closing |= TCP_P_RST_CLOSE;
-				TRC_ADD(trc_d, "CLOSED %x", flow->closing);
+				TRC_ADD(trc_d, "CLOSE_%x_%d_%d", flow->closing, flow->cl->inflight, flow->sv->inflight);
 			}
 		}
 	}
@@ -643,9 +655,9 @@ int parse_tcp(decode_t* dec)
 				if ((flow->closing & TCP_P_FIN_ALL) == TCP_P_FIN_ALL)
 				{	if ((my->seq_n == my->seq_a) && (peer->seq_a == peer->seq_n))
 					{	flow->closing |= TCP_P_FIN_CLOSE;	
-						TRC_ADD(trc_d, "CLOSED %x", flow->closing);	
+						TRC_ADD(trc_d, "CLOSE_%x_%d_%d", flow->closing, flow->cl->inflight, flow->sv->inflight);
 					}
-					else
+					else if ((dtcp->flag & TCP_F_RST) == 0)
 					{	TRC_ADD(trc_d, "HALF_CLOSED");	}
 				}
 			}
@@ -654,6 +666,9 @@ int parse_tcp(decode_t* dec)
 		{	TRC_ADD(trc_d, "DUP_ACK ?");
 		}
 	}
+
+	// update window
+	my->win = dtcp->win << my->win_scale;
 
 	TRC_ADD(*trc_lr, "F:%d [%d]", my->inflight, dec->app_len);
 
@@ -679,21 +694,6 @@ int parse_tcp(decode_t* dec)
 
 	// LOST PACKET
 
-
-	// check ack 
-	if (dec->tcp.flag & TCP_F_ACK)
-	{		
-		if ((flow->opening & TCP_P_SEQ_SET) == 0)
-		{	my->seq_b = dec->tcp.seq - 1;	
-			peer->seq_b = dec->tcp.ack -1;
-			flow->opening |= TCP_P_SEQ_SET;
-		}	
-
-		// see wireshark/epan/dissector/packet-tcp.c/tcp_analyze_sequence_number
-
-
-
-	}
 	// dump_flow_tcp(flow);
 
 */
