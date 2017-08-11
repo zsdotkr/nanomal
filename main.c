@@ -51,6 +51,13 @@ typedef struct
 	int				port;
 } ip_port_t;
 
+typedef struct decode_val_pair_t
+{	uint8_t				last;		
+	uint32_t			start, end;	
+} __attribute__ ((packed)) decode_val_pair_t;
+
+#define MAX_DECODE_POOL	(sizeof(decode_val_pair_t) * 50)
+
 typedef struct 
 {	uint32_t			seq;
 	uint32_t			ack;
@@ -60,6 +67,7 @@ typedef struct
 	int					mss;		// Option
 	int					win_scale;	// Option
 	int					use_sack;	// Option
+	decode_val_pair_t*	sack_blk;	// sack blocks
 } dec_tcp_t;
 
 typedef struct 
@@ -79,7 +87,26 @@ typedef struct
 	{
 		dec_tcp_t	tcp;
 	};
+
+	// poll area (I don't like to use malloc)
+	int				pool_alloc; 
+	uint8_t			pool[MAX_DECODE_POOL];	
 } decode_t;
+
+void* decode_pool_alloc(decode_t* dec, int size)
+{	void* ret;
+
+	THROW(ERR, size == 0);
+	THROW(ERR, (dec->pool_alloc + size) >= MAX_DECODE_POOL);
+
+	ret = &dec->pool[dec->pool_alloc];
+	dec->pool_alloc += size;
+
+	return ret;
+
+CATCH(ERR)
+	return NULL;
+}
 
 char* tcp_flag_to_str(int flag, char* ret)
 {	int		pos;
@@ -99,7 +126,7 @@ char* tcp_flag_to_str(int flag, char* ret)
 	
 	return ret;
 }
-#define tcp_flag_print(x)	tcp_flag_to_str(x, alloca(10))
+#define tcp_flag_prt(x)	tcp_flag_to_str(x, alloca(10))
 
 int chk_wellknown_udp(decode_t* dec)
 {	switch (dec->dest.port)
@@ -109,6 +136,31 @@ int chk_wellknown_udp(decode_t* dec)
 		case 67:	TRC_ADD(dec->trc, "DHCP");	break;
 	}
 	return 0;
+}
+
+decode_val_pair_t* decode_tcp_sack_block(decode_t* dec, p_tcp_opt_t* opt)
+{	uint32_t*			pval = &opt->d.d32;
+	int 				items = opt->len; 
+	decode_val_pair_t* 	ptr; 
+	int					pos;
+
+	items -= offsetof(p_tcp_opt_t, d);
+	items /= 8; 
+		
+	ptr = decode_pool_alloc(dec, items * sizeof(*ptr));
+	THROW(ERR, ptr == NULL);
+
+	for(pos = 0; pos < items; pos++)
+	{	ptr[pos].last = 0;	
+		ptr[pos].start = ntohl(*pval);	pval++;
+		ptr[pos].end = ntohl(*pval);	pval++;
+	}
+	ptr[pos-1].last = 1;
+
+	return ptr;
+
+CATCH(ERR)
+	return NULL;
 }
 
 int decode_l4(decode_t* dec, const uint8_t* raw, int cap_len)
@@ -257,7 +309,7 @@ int decode_l4(decode_t* dec, const uint8_t* raw, int cap_len)
 			dec_tcp->ack = ntohl(hdr->ack_seq);
 			dec_tcp->win = ntohs(hdr->window);
 			dec_tcp->urg = ntohs(hdr->urg_ptr);
-			TRC_ADD(dec->trc, "[%s]", tcp_flag_print(dec_tcp->flag));
+			TRC_ADD(dec->trc, "[%s]", tcp_flag_prt(dec_tcp->flag));
 			TRC_ADD(dec->trc_o, "S/A=%d/%d", dec_tcp->seq % 10000, dec_tcp->ack % 10000);
 			TRC_ADD(dec->trc_o, "W:%d", dec_tcp->win);
 			dec_tcp->mss = 1460; 
@@ -273,16 +325,25 @@ int decode_l4(decode_t* dec, const uint8_t* raw, int cap_len)
 				{	opt = (p_tcp_opt_t*) raw; 
 					switch (opt->type)
 					{	case 2 : // MSS 
-						dec_tcp->mss = ntohs(opt->d.d16);
-						TRC_ADD(dec->trc_o, "MSS:%d", dec_tcp->mss);
+							dec_tcp->mss = ntohs(opt->d.d16);
+							TRC_ADD(dec->trc_o, "MSS:%d", dec_tcp->mss);
 						break;
-						case 4 : // SACK 
-						dec_tcp->use_sack = 1;
-						TRC_ADD(dec->trc_o, "SACK");
+						case 4 : // use SACK 
+							dec_tcp->use_sack = 1;
+							TRC_ADD(dec->trc_o, "SACK");
 						break;
 						case 3 : // WINDOW SCALE
-						dec_tcp->win_scale = opt->d.d8;
-						TRC_ADD(dec->trc_o, "WS:%d", dec_tcp->win_scale);
+							dec_tcp->win_scale = opt->d.d8;
+							TRC_ADD(dec->trc_o, "WS:%d", dec_tcp->win_scale);
+						break;
+						case 5 : // SACK block 
+							dec_tcp->sack_blk = decode_tcp_sack_block(dec, opt);
+						break;
+						case 1 : // NOP
+							; // nothing to do 
+						break;
+						default: 
+							DBG("Unknown TCP OPT:%d", opt->type);
 						break;
 					}
 					if (opt->type == 1)	// NOP
@@ -357,19 +418,32 @@ typedef struct
 	uint8_t			closing;	// closing flag, TCP_P_xxx
 	#define TCP_P_FIN_LOW		(1 << 0)
 	#define TCP_P_FIN_HI		(1 << 1)
-	#define TCP_P_FIN_ACK_LOW	(1 << 2)
-	#define TCP_P_FIN_ACK_HI	(1 << 3)
-	#define TCP_P_FIN_CLOSE		(1 << 4)
-	#define TCP_P_RST_LOW		(1 << 5)
-	#define TCP_P_RST_HI		(1 << 6)
-	#define TCP_P_RST_CLOSE		(1 << 7)
-	#define TCP_P_FIN_ALL		(TCP_P_FIN_LOW|TCP_P_FIN_HI|TCP_P_FIN_ACK_LOW|TCP_P_FIN_ACK_HI)
+	#define TCP_P_FIN_CLOSE		(1 << 2)
+	#define TCP_P_RST_LOW		(1 << 3)
+	#define TCP_P_RST_HI		(1 << 4)
+	#define TCP_P_RST_CLOSE		(1 << 5)
+	#define TCP_P_CLOSE_ANY		(TCP_P_RST_CLOSE | TCP_P_FIN_CLOSE)
+	#define TCP_P_FIN_ALL		(TCP_P_FIN_LOW | TCP_P_FIN_HI)
 
 	int				evt;			// TCP_EVT_xxx
 	#define TCP_EVT_ZERO_WIN		1
 	#define TCP_EVT_ZERO_WIN_PROBE	2
 
 } flow_tcp_t;
+
+char* closing_to_str(int closing, char* ret)
+{	int	pos = 0; 
+	if (closing & TCP_P_FIN_LOW)		ret[pos++] = 'f';
+	if (closing & TCP_P_FIN_HI)			ret[pos++] = 'F';
+	// if (closing & TCP_P_FIN_ACK_LOW)	ret[pos++] = 'a';
+	// if (closing & TCP_P_FIN_ACK_HI)		ret[pos++] = 'A';
+	if (closing & TCP_P_FIN_CLOSE)		ret[pos++] = '1';
+	if (closing & TCP_P_RST_LOW)		ret[pos++] = 'r';
+	if (closing & TCP_P_RST_HI)			ret[pos++] = 'R';
+	if (closing & TCP_P_RST_CLOSE)		ret[pos++] = '2';
+	return ret; 
+}
+#define closing_prt(x)	closing_to_str(x, alloca(10))
 
 typedef struct 
 {	union
@@ -452,8 +526,8 @@ void dump_flow_tcp(flow_tcp_t* flow, int opt)
 	if (opt & 0x01)
 	{	DBG("opening:%x, closing:%x", flow->opening, flow->closing);
 
-		sprintf(str1, "%s:%d", zl_ip_print(cl->ipp.ip), cl->ipp.port); 
-		sprintf(str2, "%s:%d", zl_ip_print(sv->ipp.ip), sv->ipp.port);
+		sprintf(str1, "%s:%d", zl_ip_prt(cl->ipp.ip), cl->ipp.port); 
+		sprintf(str2, "%s:%d", zl_ip_prt(sv->ipp.ip), sv->ipp.port);
 		DBG("IP        : %32s %32s", str1, str2);
 
 		sprintf(str1, "%d/%d/%d", cl->win_b<<cl->win_scale, cl->mss_b, cl->use_sack);
@@ -479,6 +553,7 @@ int parse_tcp(decode_t* dec)
 {	dec_tcp_t*	dtcp = &dec->tcp;
 	flow_tcp_t*	flow; 
 	struct flow_tcp_side_t	*my, *peer;
+	int			tflag;
 	trc_t*		trc_lr;
 	trc_t		trc_d, trc_l, trc_r;
 
@@ -536,7 +611,7 @@ int parse_tcp(decode_t* dec)
 	}
 
 	TRC_ADD(trc_l, "%3d [T %d/%d]", g_pkt_id, flow->cl->ipp.port, flow->sv->ipp.port);
-	TRC_ADD(trc_l, "[%-3s]", tcp_flag_print(dtcp->flag));
+	TRC_ADD(trc_l, "[%-3s]", tcp_flag_prt(dtcp->flag));
 	
 	// get my & peer flow 
 	if (EQUAL_PTR(&dec->src, &flow->cl->ipp))
@@ -544,12 +619,13 @@ int parse_tcp(decode_t* dec)
 	else
 	{	my = flow->sv;	peer = flow->cl;	trc_lr = &trc_r;	}
 
+	// add stat
 	my->stat.pkt++;
 	my->stat.raw += dec->pkt_len;
 
 	// setup sequence 
 	if ((flow->opening & TCP_P_SEQ_SET) == 0)
-	{	if ((dtcp->flag & TCP_F_SYN_ACK) == TCP_F_SYN)
+	{	if ((dtcp->flag & TCP_F_SYN_ACK) == TCP_F_SYN)	// SYN
 		{	if ((flow->opening & TCP_P_SYN) == TCP_P_SYN)
 			{	TRC_ADD(trc_d, "DUP_SYN");
 			}
@@ -560,13 +636,13 @@ int parse_tcp(decode_t* dec)
 				my->win_scale = dtcp->win_scale;
 
 				my->seq_b = dtcp->seq; 
-				my->seq_n = dtcp->seq+1; 
+				my->seq_n = dtcp->seq + 1; 
 				my->seq_a = dtcp->seq;
 
 				flow->opening |= TCP_P_SYN;
 			}
 		}
-		else if ((dtcp->flag & TCP_F_SYN_ACK) == TCP_F_SYN_ACK)
+		else if ((dtcp->flag & TCP_F_SYN_ACK) == TCP_F_SYN_ACK) // SYN_ACK
 		{	if ((flow->opening & TCP_P_SYN_ACK) == TCP_P_SYN_ACK)
 			{	TRC_ADD(trc_d, "DUP_SYN_ACK");
 				return 0;
@@ -585,37 +661,31 @@ int parse_tcp(decode_t* dec)
 				TRC_ADD(trc_d, "OPEN_%x", flow->opening);
 			}
 		}
-		else
+		else	// other
 		{	
 			my->seq_b = dtcp->seq; 
-			my->seq_n = dtcp->seq;// + 1 + dec->app_len;// + 1;
+			my->seq_n = dtcp->seq;
 			my->seq_a = dtcp->seq;
+			my->win = dtcp->win;
 
-			peer->seq_b = dtcp->ack;// - 1; 
-			peer->seq_n = dtcp->ack;// - dec->app_len;
-			peer->seq_a = dtcp->ack;// - dec->app_len;
+			peer->seq_b = dtcp->ack;
+			peer->seq_n = dtcp->ack;
+			peer->seq_a = dtcp->ack;
 
 			flow->opening |= TCP_P_SEQ_SET;
-			TRC_ADD(trc_d, "FOPEN_%d", flow->opening);
+			TRC_ADD(trc_d, "FOPEN_%x", flow->opening);
 		}
 	}
 
 	TRC_ADD(*trc_lr, "S:%d A:%d W:%d", dtcp->seq - my->seq_b, 
 		dtcp->ack - peer->seq_b, dtcp->win << my->win_scale);
 
-	// check window update
-	if ((dec->app_len == 0) && (dtcp->flag == TCP_F_ACK))
-	{	if (dtcp->ack == peer->seq_a)
-		{	int		diff = (dtcp->win << my->win_scale) - my->win; 
-			if (diff > 0)	TRC_ADD(trc_d, "WIN_UPDATE_%d", diff);	
-		}
-	}
 
 	// check zero window, NOT TESTED
 	if ((dtcp->win == 0) && ((dtcp->flag & TCP_F_RST) == 0))
 	{	TRC_ADD(trc_d, "ZERO_WIN ?");	}
 
-	// zero window probing, NOT TESTED
+	// check zero window probing, NOT TESTED
 	if ((dec->app_len == 1) && (dtcp->seq == my->seq_n) && (peer->win == 0))
 	{	TRC_ADD(trc_d, "ZERO_WIN_PROBE ?");	}
 
@@ -635,79 +705,77 @@ int parse_tcp(decode_t* dec)
 		}
 	}
 
-	// process FIN
-	if (dtcp->flag & TCP_F_FIN)
-	{	if (flow->closer == 0)	// if first close
-		{	flow->closer = (my == &flow->low) ? 'l' : 'h';
-		}	
-		
-		if (my == &flow->low)
-		{	if (flow->closing & TCP_P_FIN_LOW)
-			{	TRC_ADD(trc_d, "DUP_FIN");	}
-			else
-			{	flow->closing |= TCP_P_FIN_LOW;	}
-		}
-		else	// high side
-		{	if (flow->closing & TCP_P_FIN_HI)
-			{	TRC_ADD(trc_d, "DUP_FIN");	}
-			else
-			{	flow->closing |= TCP_P_FIN_HI;	}
-		}
-		my->seq_n = dtcp->seq + 1;
-	}
-
-	// process RST
-	if (dtcp->flag & TCP_F_RST)
-	{	if (flow->closer == 0)
-		{	flow->closer = (my == &flow->low) ? 'l' : 'h';	}
-
-		int	mask = (my == &flow->low) ? TCP_P_RST_LOW : TCP_P_RST_HI;
-
-		if (flow->closing & mask)
-		{	TRC_ADD(trc_d, "DUP_RST");	}
-		else
-		{	flow->closing |= mask; 
-			if ((flow->closing & (TCP_P_FIN_CLOSE | TCP_P_RST_CLOSE)) == 0)
-			{	flow->closing |= TCP_P_RST_CLOSE;
-				TRC_ADD(trc_d, "CLOSE_%x_%d_%d", flow->closing, flow->cl->inflight, flow->sv->inflight);
-			}
-		}
-	}
-
 	// process ACK 
 	if (dtcp->flag & TCP_F_ACK)
-	{	if (GT_SEQ(dtcp->ack, peer->seq_n))
-		{	
-			TRC_ADD(trc_d, "packet lost ??");	// TODO
+	{	
+		if (GT_SEQ(dtcp->ack, peer->seq_n))
+		{	TRC_ADD(trc_d, "packet lost ?? (%d,%d)", dtcp->ack - peer->seq_b, 
+				peer->seq_n - peer->seq_b);	// TODO
 		}
-		else if (GE_SEQ(dtcp->ack, peer->seq_a))
+		else if (GT_SEQ(dtcp->ack, peer->seq_a))
 		{	
 			peer->inflight -= (dtcp->ack - peer->seq_a); 	
-			// adjust while SYN, FIN 
+
+			// adjust if SYN
 			if (peer->inflight == -1)	
 			{	peer->inflight = 0; }
 
 			peer->seq_a = dtcp->ack;
 
-			if (dtcp->ack == peer->seq_n)
-			{	
-				if ((my == &flow->low) && (flow->closing & TCP_P_FIN_LOW))
-				{	flow->closing |= TCP_P_FIN_ACK_LOW;	}
-				if ((my == &flow->hi) && (flow->closing & TCP_P_FIN_HI))
-				{	flow->closing |= TCP_P_FIN_ACK_HI;	}
-
-				if ((flow->closing & TCP_P_FIN_ALL) == TCP_P_FIN_ALL)
-				{	if ((my->seq_n == my->seq_a) && (peer->seq_a == peer->seq_n))
-					{	flow->closing |= TCP_P_FIN_CLOSE;	
-						TRC_ADD(trc_d, "CLOSE_%x_%d_%d", flow->closing, flow->cl->inflight, flow->sv->inflight);
-					}
-					else if ((dtcp->flag & TCP_F_RST) == 0)
-					{	TRC_ADD(trc_d, "HALF_CLOSED");	}
-				}
+			// check last ACK in F > FA > A sequence
+			if ((flow->closing & (TCP_P_FIN_ALL | TCP_P_CLOSE_ANY)) == TCP_P_FIN_ALL)
+			{	flow->closing |= TCP_P_FIN_CLOSE;
+				TRC_ADD(trc_d, "CLOSE_F_%d_%d", flow->cl->inflight, flow->sv->inflight);
 			}
 		}
 		else	// dtcp->ack <= peer->seq_a
-		{	TRC_ADD(trc_d, "DUP_ACK ?");
+		{	int	win_up = (dtcp->win << my->win_scale) - my->win;	
+			if (dtcp->sack_blk)
+			{	;	} 	// nothing to do 
+			else if (dec->app_len)
+			{	;	}	// nothing to do 
+			else if ((dec->app_len == 0) && (dtcp->ack == peer->seq_a) && (win_up > 0))
+			{	TRC_ADD(trc_d, "WIN_UPDATE_%d", win_up);
+			}
+			else if ((dtcp->flag & (TCP_F_FIN | TCP_F_RST)) == 0)
+			{	TRC_ADD(trc_d, "DUP_ACK");	}
+		}
+
+		if (dtcp->sack_blk)	{	TRC_ADD(trc_d, "SACK_BLK");	}
+	}
+
+	// check FIN
+	if (dtcp->flag & TCP_F_FIN)
+	{	if (flow->closer == 0)	// if first close
+		{	flow->closer = (my == &flow->low) ? 'l' : 'h';
+			TRC_ADD(trc_d, "HALF_CLOSE");
+		}	
+
+		tflag = (my == &flow->low) ? TCP_P_FIN_LOW : TCP_P_FIN_HI;
+
+		if (flow->closing & tflag)
+		{	TRC_ADD(trc_d, "DUP_FIN");	}
+		else
+		{	flow->closing |= tflag; 
+			my->seq_n ++;	
+		}
+	}
+
+	// check RST
+	if (dtcp->flag & TCP_F_RST)
+	{	if (flow->closer == 0)
+		{	flow->closer = (my == &flow->low) ? 'l' : 'h';	}
+
+		tflag = (my == &flow->low) ? TCP_P_RST_LOW : TCP_P_RST_HI;
+
+		if (flow->closing & tflag)
+		{	TRC_ADD(trc_d, "DUP_RST");	}
+		else
+		{	flow->closing |= tflag; 
+			if ((flow->closing & (TCP_P_FIN_CLOSE | TCP_P_RST_CLOSE)) == 0)
+			{	flow->closing |= TCP_P_RST_CLOSE;
+				TRC_ADD(trc_d, "CLOSE_R_%d_%d", flow->cl->inflight, flow->sv->inflight);
+			}
 		}
 	}
 
@@ -720,7 +788,7 @@ int parse_tcp(decode_t* dec)
 		(trc_d.d[0]) ? "##" : "", trc_d.d);
 
 	// print statistics
-	if ((flow->closing & (TCP_P_FIN_CLOSE | TCP_P_RST_CLOSE)))
+	if (flow->closing & TCP_P_CLOSE_ANY)
 	{	DBG("Client Pkts:%5d Bytes:%zd Payload:%zd", 
 			flow->cl->stat.pkt, flow->cl->stat.raw, flow->cl->stat.payload);	
 		DBG("Server Pkts:%5d Bytes:%zd Payload:%zd", 
@@ -760,21 +828,18 @@ void parse(struct pcap_pkthdr* hdr, const uint8_t* raw)
 
 	if (decode_l4(&dec, raw, hdr->caplen) < 0)
 	{	ERR("%s %s:%d -> %s:%d %s", __func__, 
-			zl_ip_print(dec.src.ip), dec.src.port, 
-			zl_ip_print(dec.dest.ip), dec.dest.port, 
+			zl_ip_prt(dec.src.ip), dec.src.port, 
+			zl_ip_prt(dec.dest.ip), dec.dest.port, 
 			dec.trc.d);
 	}	
-
 
 
 	if (dec.app == APP_TCP)
 	{	parse_tcp(&dec);	}
 	else
 	{	LOG("%2d) %d > %d %s %s [%s %s]", g_pkt_id, 
-			dec.src.port, dec.dest.port, 
-			dec.trc.d, dec.trc_o.d, 
-			zl_ip_print(dec.src.ip), 
-			zl_ip_print(dec.dest.ip));
+			dec.src.port, dec.dest.port, dec.trc.d, dec.trc_o.d, 
+			zl_ip_prt(dec.src.ip), zl_ip_prt(dec.dest.ip));
 	}
 }
 
