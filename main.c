@@ -765,17 +765,17 @@ void parse(struct pcap_pkthdr* hdr, const uint8_t* raw)
 			dec.trc.d);
 	}	
 
-	LOG("%2d) %d > %d %s %s [%s %s]", g_pkt_id, 
-		dec.src.port, dec.dest.port, 
-		dec.trc.d, dec.trc_o.d, 
-		zl_ip_print(dec.src.ip), 
-		zl_ip_print(dec.dest.ip));
-		
 
 
 	if (dec.app == APP_TCP)
 	{	parse_tcp(&dec);	}
-
+	else
+	{	LOG("%2d) %d > %d %s %s [%s %s]", g_pkt_id, 
+			dec.src.port, dec.dest.port, 
+			dec.trc.d, dec.trc_o.d, 
+			zl_ip_print(dec.src.ip), 
+			zl_ip_print(dec.dest.ip));
+	}
 }
 
 
