@@ -399,6 +399,7 @@ typedef struct
 
 		uint32_t	seq_n; 		// next sequence
 		uint32_t	seq_a; 		// sequence acked
+		uint32_t	seq_lost;	// sequence when detect lost 
 		uint32_t	win;		// current window
 		int			inflight;	// inflight bytes
 
@@ -638,6 +639,7 @@ int parse_tcp(decode_t* dec)
 				my->seq_b = dtcp->seq; 
 				my->seq_n = dtcp->seq + 1; 
 				my->seq_a = dtcp->seq;
+				my->seq_lost = my->seq_a;
 
 				flow->opening |= TCP_P_SYN;
 			}
@@ -656,6 +658,7 @@ int parse_tcp(decode_t* dec)
 				my->seq_b = dtcp->seq; 
 				my->seq_n = dtcp->seq + 1; 
 				my->seq_a = dtcp->seq;
+				my->seq_lost = my->seq_a;
 
 				flow->opening |= (TCP_P_SYN_ACK | TCP_P_SEQ_SET);
 				TRC_ADD(trc_d, "OPEN_%x", flow->opening);
@@ -666,11 +669,13 @@ int parse_tcp(decode_t* dec)
 			my->seq_b = dtcp->seq; 
 			my->seq_n = dtcp->seq;
 			my->seq_a = dtcp->seq;
+			my->seq_lost = my->seq_a;
 			my->win = dtcp->win;
 
 			peer->seq_b = dtcp->ack;
 			peer->seq_n = dtcp->ack;
 			peer->seq_a = dtcp->ack;
+			peer->seq_lost = dtcp->ack;
 
 			flow->opening |= TCP_P_SEQ_SET;
 			TRC_ADD(trc_d, "FOPEN_%x", flow->opening);
@@ -691,8 +696,11 @@ int parse_tcp(decode_t* dec)
 
 	// process payload
 	if (dec->app_len)	
-	{	if (LT_SEQ(dtcp->seq, my->seq_n))
-		{	TRC_ADD(trc_d, "RETX");	}
+	{	
+		if (LT_SEQ(dtcp->seq, my->seq_n))	
+		{	if (LT_SEQ(dtcp->seq, my->seq_lost))	{	TRC_ADD(trc_d, "RETX");	}
+			else									{	TRC_ADD(trc_d, "DELAYED_PAYLOAD");	}
+		}
 		else if (dtcp->seq == my->seq_n)
 		{	my->seq_n += dec->app_len;
 			my->inflight += dec->app_len;
@@ -709,8 +717,10 @@ int parse_tcp(decode_t* dec)
 	if (dtcp->flag & TCP_F_ACK)
 	{	
 		if (GT_SEQ(dtcp->ack, peer->seq_n))
-		{	TRC_ADD(trc_d, "packet lost ?? (%d,%d)", dtcp->ack - peer->seq_b, 
-				peer->seq_n - peer->seq_b);	// TODO
+		{	TRC_ADD(trc_d, "PACKET_LOST(%d)", dtcp->ack - peer->seq_n);
+			peer->seq_lost = peer->seq_n; 	// save current seq
+			peer->inflight += dtcp->ack - peer->seq_n; 	// update inflight forcefully
+			peer->seq_n = dtcp->ack+1;		// update seq forcefully
 		}
 		else if (GT_SEQ(dtcp->ack, peer->seq_a))
 		{	
@@ -721,6 +731,7 @@ int parse_tcp(decode_t* dec)
 			{	peer->inflight = 0; }
 
 			peer->seq_a = dtcp->ack;
+			peer->seq_lost = peer->seq_a;
 
 			// check last ACK in F > FA > A sequence
 			if ((flow->closing & (TCP_P_FIN_ALL | TCP_P_CLOSE_ANY)) == TCP_P_FIN_ALL)
@@ -794,21 +805,7 @@ int parse_tcp(decode_t* dec)
 		DBG("Server Pkts:%5d Bytes:%zd Payload:%zd", 
 			flow->sv->stat.pkt, flow->sv->stat.raw, flow->sv->stat.payload);	
 	}
-/*
-	// zero window
-	if (my->win == 0)	
-	{	flow->evt |= TCP_EVT_ZERO_WIN;	DBG("Zero Window");	}
 
-	// zero window probing
-	if ((dec->app_len == 1) && (dec->tcp.seq == my->seq_n) && 
-			(my->win == 0))
-	{	flow->evt |= TCP_EVT_ZERO_WIN_PROBE;	DBG("Zero Window Probing");	}
-
-	// LOST PACKET
-
-	// dump_flow_tcp(flow);
-
-*/
 	return 0;
 
 CATCH(DROP)

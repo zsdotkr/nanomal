@@ -28,7 +28,7 @@ int zl_ip_is_v4(zl_ip_t* ptr)
 }
 
 void zl_ip_set_ip4(zl_ip_t* ptr, uint32_t ip)
-{	memset(ptr, 0, sizeof(*ptr));
+{	ptr->dmy[0] = ptr->dmy[1] = ptr->dmy[2] = 0;
 	ptr->v4 = ip; 
 	ptr->flag = htonl(ZS_IP_MAGIC);
 }
