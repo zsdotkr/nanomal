@@ -1,0 +1,13 @@
+Run Options
+  * Device Name         : any
+  * Filter              : any
+  * Statistics Interval : 60 [sec]
+  * PCAP File           : sample/tcp_ffa.pcapng
+Start
+  1 [T 49464/443] [.A.F.]                                    < S:0 A:0 W:168 F:0 [0]  ## CREATE FOPEN_4 HALF_CLOSE [1] 
+  2 [T 49464/443] [.A...] S:0 A:1 W:16560 F:0 [0]            >   
+  3 [T 49464/443] [.A.F.] S:0 A:1 W:16560 F:0 [0]            >   
+  4 [T 49464/443] [.A...]                                    < S:1 A:1 W:168 F:0 [0]  ## CLOSE_Fh_0_0 [4] 
+ ## Client Pkts:    2 Bytes:108 Payload:0
+ ## Server Pkts:    2 Bytes:108 Payload:0
+End (total 4 pkts)

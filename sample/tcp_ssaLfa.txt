@@ -1,0 +1,14 @@
+Run Options
+  * Device Name         : any
+  * Filter              : any
+  * Statistics Interval : 60 [sec]
+  * PCAP File           : sample/tcp_ssaLfa.pcap
+Start
+  1 [T 49507/80] [S....] S:0 A:0 W:32768 F:0 [0]             >  ## CREATE [1] 
+  2 [T 49507/80] [SA...]                                     < S:0 A:1 W:1868800 F:0 [0]  ## OPEN_7 [2] 
+  3 [T 49507/80] [.A...] S:1 A:1 W:66240 F:0 [0]             >   
+  4 [T 49507/80] [.A.F.]                                     < S:1 A:2 W:14720 F:0 [0]  ## FIRST_FIN_LOST HALF_CLOSE [4] 
+  5 [T 49507/80] [.A...] S:2 A:2 W:66240 F:0 [0]             >  ## CLOSE_Fl_0_0 [5] 
+ ## Client Pkts:    3 Bytes:174 Payload:0
+ ## Server Pkts:    2 Bytes:120 Payload:0
+End (total 5 pkts)

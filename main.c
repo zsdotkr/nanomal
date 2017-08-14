@@ -771,7 +771,7 @@ int parse_tcp(decode_t* dec)
 
 				if ((flow->closing & (TCP_P_FIN_ALL | TCP_P_CLOSE_ANY)) == TCP_P_FIN_ALL)
 				{	flow->closing |= TCP_P_FIN_CLOSE;
-					TRC_ADD(trc_d, "CLOSE_F_%d_%d", flow->cl->inflight, flow->sv->inflight);
+					TRC_ADD(trc_d, "CLOSE_F%c_%d_%d", flow->closer, flow->cl->inflight, flow->sv->inflight);
 				}
 			}
 			else
@@ -795,7 +795,7 @@ int parse_tcp(decode_t* dec)
 			// check last ACK in F > FA > A sequence
 			if ((flow->closing & (TCP_P_FIN_ALL | TCP_P_CLOSE_ANY)) == TCP_P_FIN_ALL)
 			{	flow->closing |= TCP_P_FIN_CLOSE;
-				TRC_ADD(trc_d, "CLOSE_F_%d_%d", flow->cl->inflight, flow->sv->inflight);
+				TRC_ADD(trc_d, "CLOSE_F%c_%d_%d", flow->closer, flow->cl->inflight, flow->sv->inflight);
 			}
 		}
 		else	// dtcp->ack <= peer->seq_a
@@ -864,7 +864,7 @@ int parse_tcp(decode_t* dec)
 		else
 		{	if ((flow->closing & (TCP_P_FIN_CLOSE | TCP_P_RST_CLOSE)) == 0)
 			{	flow->closing |= TCP_P_RST_CLOSE;
-				TRC_ADD(trc_d, "CLOSE_R_%d_%d", flow->cl->inflight, flow->sv->inflight);
+				TRC_ADD(trc_d, "CLOSE_R%c_%d_%d", flow->closer, flow->cl->inflight, flow->sv->inflight);
 			}
 		}
 	}
@@ -874,14 +874,16 @@ int parse_tcp(decode_t* dec)
 
 	TRC_ADD(*trc_lr, "F:%d [%d]", my->inflight, dec->app_len);
 
+	if (trc_d.d[0])	{	TRC_ADD(trc_d, "[%d]", g_pkt_id);	}
+
 	LOG("%-60s %c %s %s %s", trc_l.d, (trc_lr == &trc_l) ? '>' : '<', trc_r.d, 
 		(trc_d.d[0]) ? "##" : "", trc_d.d);
 
 	// print statistics
 	if (flow->closing & TCP_P_CLOSE_ANY)
-	{	DBG("Client Pkts:%5d Bytes:%zd Payload:%zd", 
+	{	LOG(" ## Client Pkts:%5d Bytes:%zd Payload:%zd", 
 			flow->cl->stat.pkt, flow->cl->stat.raw, flow->cl->stat.payload);	
-		DBG("Server Pkts:%5d Bytes:%zd Payload:%zd", 
+		LOG(" ## Server Pkts:%5d Bytes:%zd Payload:%zd", 
 			flow->sv->stat.pkt, flow->sv->stat.raw, flow->sv->stat.payload);	
 	}
 
@@ -1093,7 +1095,10 @@ int main(int argc, char* argv[])
 			total_read++;	cur_read++;
 		}
 		else	// get system time if read timeout
-		{	gettimeofday(&pcap_hdr.ts, NULL);
+		{	if (pcap_file[0] == 0)	// if live capture	
+			{	gettimeofday(&pcap_hdr.ts, NULL);	}
+			else
+			{	goto END;	}
 		}
 		
 		if ((pcap_hdr.ts.tv_sec % g_stat_intv) == 0)
@@ -1123,6 +1128,7 @@ int main(int argc, char* argv[])
 			}
 		}
 	}		
+END:
 	LOG("End (total %zd pkts)", total_read);
 	pcap_close(pc);
 

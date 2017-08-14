@@ -1,0 +1,18 @@
+Run Options
+  * Device Name         : any
+  * Filter              : any
+  * Statistics Interval : 60 [sec]
+  * PCAP File           : sample/tcp_ssxffa.pcapng
+Start
+  1 [T 59836/80] [S....] S:0 A:0 W:32768 F:0 [0]             >  ## CREATE [1] 
+  2 [T 59836/80] [SA...]                                     < S:0 A:1 W:1868800 F:0 [0]  ## OPEN_7 [2] 
+  3 [T 59836/80] [.A...] S:1 A:1 W:66240 F:0 [0]             >   
+  4 [T 59836/80] [SA...]                                     < S:0 A:1 W:1868800 F:0 [0]  ## DUP_ACK [4] 
+  5 [T 59836/80] [.A...] S:1 A:1 W:66240 F:0 [0]             >  ## SACK_BLK [5] 
+  6 [T 59836/80] [.A.F.]                                     < S:1 A:1 W:14720 F:0 [0]  ## HALF_CLOSE [6] 
+  7 [T 59836/80] [.A...] S:1 A:2 W:66240 F:0 [0]             >   
+  8 [T 59836/80] [.A.F.] S:1 A:2 W:66240 F:0 [0]             >   
+  9 [T 59836/80] [.A...]                                     < S:2 A:2 W:14720 F:0 [0]  ## CLOSE_Fl_0_0 [9] 
+ ## Client Pkts:    5 Bytes:294 Payload:0
+ ## Server Pkts:    4 Bytes:240 Payload:0
+End (total 9 pkts)

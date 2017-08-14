@@ -1,0 +1,9 @@
+Run Options
+  * Device Name         : any
+  * Filter              : any
+  * Statistics Interval : 60 [sec]
+  * PCAP File           : sample/tcp_ss.pcapng
+Start
+  1 [T 49563/22] [S....] S:0 A:0 W:32768 F:0 [0]             >  ## CREATE [1] 
+  2 [T 49563/22] [S....] S:0 A:0 W:32768 F:0 [0]             >  ## DUP_SYN [2] 
+End (total 2 pkts)

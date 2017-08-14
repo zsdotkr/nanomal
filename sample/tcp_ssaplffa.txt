@@ -1,0 +1,18 @@
+Run Options
+  * Device Name         : any
+  * Filter              : any
+  * Statistics Interval : 60 [sec]
+  * PCAP File           : sample/tcp_ssaplffa.pcap
+Start
+  1 [T 49510/80] [S....] S:0 A:0 W:32768 F:0 [0]             >  ## CREATE [1] 
+  2 [T 49510/80] [SA...]                                     < S:0 A:1 W:1868800 F:0 [0]  ## OPEN_7 [2] 
+  3 [T 49510/80] [.A...] S:1 A:1 W:66240 F:0 [0]             >   
+  4 [T 49510/80] [.A...]                                     < S:1 A:670 W:16000 F:0 [0]  ## PACKET_LOST(669) [4] 
+  5 [T 49510/80] [.AP..]                                     < S:1 A:670 W:16000 F:338 [338]   
+  6 [T 49510/80] [.A.F.]                                     < S:339 A:670 W:16000 F:338 [0]  ## HALF_CLOSE [6] 
+  7 [T 49510/80] [.A...] S:670 A:340 W:65900 F:0 [0]         >   
+  8 [T 49510/80] [.A.F.] S:670 A:340 W:65900 F:0 [0]         >   
+  9 [T 49510/80] [.A...]                                     < S:340 A:671 W:16000 F:0 [0]  ## CLOSE_Fh_0_0 [9] 
+ ## Client Pkts:    4 Bytes:228 Payload:0
+ ## Server Pkts:    5 Bytes:620 Payload:338
+End (total 9 pkts)
