@@ -550,6 +550,23 @@ void dump_flow_tcp(flow_tcp_t* flow, int opt)
 
 #define EQUAL_PTR(x, y)		(memcmp(x, y, sizeof(*x)) == 0)
 
+int tcp_flow_set_closer(flow_tcp_t* flow, struct flow_tcp_side_t* side, int type)
+{	int		closer, fflag, dup;	
+
+	if (side == &flow->low)	{	closer = 'l'; 	fflag = TCP_P_FIN_LOW | TCP_P_RST_LOW;	}
+	else					{	closer = 'h';	fflag = TCP_P_FIN_HI | TCP_P_RST_HI;	}
+
+	if (type & TCP_P_FIN_CLOSE)	{	fflag &= (TCP_P_FIN_LOW | TCP_P_FIN_HI);	}
+	else						{	fflag &= (TCP_P_RST_LOW | TCP_P_RST_HI);		}
+
+	if (flow->closer == 0)	{	flow->closer = closer; 		}
+
+	dup = flow->closing & fflag;	
+	flow->closing |= fflag;		
+
+	return dup;
+}
+
 int parse_tcp(decode_t* dec)
 {	dec_tcp_t*	dtcp = &dec->tcp;
 	flow_tcp_t*	flow; 
@@ -713,14 +730,56 @@ int parse_tcp(decode_t* dec)
 		}
 	}
 
+
 	// process ACK 
 	if (dtcp->flag & TCP_F_ACK)
 	{	
 		if (GT_SEQ(dtcp->ack, peer->seq_n))
-		{	TRC_ADD(trc_d, "PACKET_LOST(%d)", dtcp->ack - peer->seq_n);
-			peer->seq_lost = peer->seq_n; 	// save current seq
-			peer->inflight += dtcp->ack - peer->seq_n; 	// update inflight forcefully
-			peer->seq_n = dtcp->ack+1;		// update seq forcefully
+		{	int diff = dtcp->ack - peer->seq_n;
+			if 		((diff == 1) && (dtcp->flag & TCP_F_FIN))
+			{	TRC_ADD(trc_d, "FIRST_FIN_LOST");	
+				// simulate first FIN
+/*
+				if (peer == &flow->low)
+				{	flow->closer = 'l';	
+					tflag = TCP_P_FIN_LOW;
+				}
+				else
+				{	flow->closer = 'h';
+					tflag = TCP_P_FIN_HI;
+				}
+				flow->closing |= tflag;
+*/
+				tcp_flow_set_closer(flow, peer, TCP_P_FIN_CLOSE);
+				TRC_ADD(trc_d, "HALF_CLOSE");
+			}
+			else if ((diff == 1) && (flow->closing & TCP_P_FIN_ALL))
+			{	TRC_ADD(trc_d, "LAST_FIN_LOST");	
+				// simulate LAST FIN
+/*
+				if (peer == &flow->low)
+				{	flow->closer = 'l';	
+					tflag = TCP_P_FIN_LOW;
+				}
+				else
+				{	flow->closer = 'h';
+					tflag = TCP_P_FIN_HI;
+				}
+				flow->closing |= tflag;
+*/
+				tcp_flow_set_closer(flow, peer, TCP_P_FIN_CLOSE);
+
+				if ((flow->closing & (TCP_P_FIN_ALL | TCP_P_CLOSE_ANY)) == TCP_P_FIN_ALL)
+				{	flow->closing |= TCP_P_FIN_CLOSE;
+					TRC_ADD(trc_d, "CLOSE_F_%d_%d", flow->cl->inflight, flow->sv->inflight);
+				}
+			}
+			else
+			{	TRC_ADD(trc_d, "PACKET_LOST(%d)", dtcp->ack - peer->seq_n);
+				peer->seq_lost = peer->seq_n; 	// save current seq
+				peer->inflight += dtcp->ack - peer->seq_n; 	// update inflight forcefully
+				peer->seq_n = dtcp->ack+1;		// update seq forcefully
+			}
 		}
 		else if (GT_SEQ(dtcp->ack, peer->seq_a))
 		{	
@@ -757,7 +816,9 @@ int parse_tcp(decode_t* dec)
 
 	// check FIN
 	if (dtcp->flag & TCP_F_FIN)
-	{	if (flow->closer == 0)	// if first close
+	{	
+/*
+		if (flow->closer == 0)	// if first close
 		{	flow->closer = (my == &flow->low) ? 'l' : 'h';
 			TRC_ADD(trc_d, "HALF_CLOSE");
 		}	
@@ -770,11 +831,20 @@ int parse_tcp(decode_t* dec)
 		{	flow->closing |= tflag; 
 			my->seq_n ++;	
 		}
+*/
+		if (flow->closer == 0)	{	TRC_ADD(trc_d, "HALF_CLOSE");	}
+
+		if (tcp_flow_set_closer(flow, my, TCP_P_FIN_CLOSE))
+		{	TRC_ADD(trc_d, "DUP_FIN");	}
+		else
+		{	my->seq_n ++;	}
 	}
 
 	// check RST
 	if (dtcp->flag & TCP_F_RST)
-	{	if (flow->closer == 0)
+	{	
+/*
+		if (flow->closer == 0)
 		{	flow->closer = (my == &flow->low) ? 'l' : 'h';	}
 
 		tflag = (my == &flow->low) ? TCP_P_RST_LOW : TCP_P_RST_HI;
@@ -784,6 +854,15 @@ int parse_tcp(decode_t* dec)
 		else
 		{	flow->closing |= tflag; 
 			if ((flow->closing & (TCP_P_FIN_CLOSE | TCP_P_RST_CLOSE)) == 0)
+			{	flow->closing |= TCP_P_RST_CLOSE;
+				TRC_ADD(trc_d, "CLOSE_R_%d_%d", flow->cl->inflight, flow->sv->inflight);
+			}
+		}
+*/
+		if (tcp_flow_set_closer(flow, my, TCP_P_RST_CLOSE))
+		{	TRC_ADD(trc_d, "DUP_RST");	}
+		else
+		{	if ((flow->closing & (TCP_P_FIN_CLOSE | TCP_P_RST_CLOSE)) == 0)
 			{	flow->closing |= TCP_P_RST_CLOSE;
 				TRC_ADD(trc_d, "CLOSE_R_%d_%d", flow->cl->inflight, flow->sv->inflight);
 			}
