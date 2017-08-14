@@ -715,8 +715,8 @@ int parse_tcp(decode_t* dec)
 	if (dec->app_len)	
 	{	
 		if (LT_SEQ(dtcp->seq, my->seq_n))	
-		{	if (LT_SEQ(dtcp->seq, my->seq_lost))	{	TRC_ADD(trc_d, "RETX");	}
-			else									{	TRC_ADD(trc_d, "DELAYED_PAYLOAD");	}
+		{	if (LE_SEQ(dtcp->seq, my->seq_lost))	{	TRC_ADD(trc_d, "DELAYED_PAYLOAD");	}
+			else									{	TRC_ADD(trc_d, "RETX");	}
 		}
 		else if (dtcp->seq == my->seq_n)
 		{	my->seq_n += dec->app_len;
