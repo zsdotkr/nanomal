@@ -56,7 +56,7 @@ typedef struct decode_val_pair_t
 	uint32_t			start, end;	
 } __attribute__ ((packed)) decode_val_pair_t;
 
-#define MAX_DECODE_POOL	(sizeof(decode_val_pair_t) * 50)
+#define MAX_DECODE_POOL	(sizeof(decode_val_pair_t) * 50) // 400 Byte
 
 typedef struct 
 {	uint32_t			seq;
@@ -147,6 +147,7 @@ decode_val_pair_t* decode_tcp_sack_block(decode_t* dec, p_tcp_opt_t* opt)
 	items -= offsetof(p_tcp_opt_t, d);
 	items /= 8; 
 		
+	// max_blocks <= 5, according to TCP standard
 	ptr = decode_pool_alloc(dec, items * sizeof(*ptr));
 	THROW(ERR, ptr == NULL);
 
@@ -397,8 +398,8 @@ typedef struct
 		uint32_t	mss_b;		// base MSS (from SYN)
 		uint32_t	use_sack;	// from SYN
 
-		uint32_t	seq_n; 		// next sequence
-		uint32_t	seq_a; 		// sequence acked
+		uint32_t	seq_n; 		// next sequence (sending)
+		uint32_t	seq_a; 		// sequence acked (sending)
 		uint32_t	seq_lost;	// sequence when detect lost 
 		uint32_t	win;		// current window
 		int			inflight;	// inflight bytes
@@ -715,7 +716,8 @@ int parse_tcp(decode_t* dec)
 	if (dec->app_len)	
 	{	
 		if (LT_SEQ(dtcp->seq, my->seq_n))	
-		{	if (LE_SEQ(dtcp->seq, my->seq_lost))	{	TRC_ADD(trc_d, "DELAYED_PAYLOAD");	}
+		{	DBG("d:%d, n:%d, l:%d", dtcp->seq - my->seq_b, my->seq_n - my->seq_b, my->seq_lost - my->seq_b);	
+			if (LE_SEQ(dtcp->seq, my->seq_lost))	{	TRC_ADD(trc_d, "DELAYED_PAYLOAD");	}
 			else									{	TRC_ADD(trc_d, "RETX");	}
 		}
 		else if (dtcp->seq == my->seq_n)
